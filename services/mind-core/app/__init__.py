@@ -1,0 +1,1 @@
+"""mind-core application package."""
