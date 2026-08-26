@@ -11,8 +11,10 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "MIND" }]
 # psycopg is required by the migration runner (migrations/run.py) and the
-# DB-backed schema tests to connect to PostgreSQL.
-dependencies = ["psycopg[binary]>=3.1"]
+# DB-backed schema tests to connect to PostgreSQL. fastapi is the HTTP
+# boundary (app/main.py); httpx backs Starlette's TestClient used by the
+# API tests. Both are required at runtime/test for the Phase 5.1 boundary.
+dependencies = ["psycopg[binary]>=3.1", "fastapi>=0.110", "httpx>=0.27"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.5"]
@@ -27,3 +29,8 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint.per-file-ignores]
+# Route tests use Depends(...) in endpoint default arguments, which is the
+# idiomatic FastAPI pattern (ruff B008). Tests are not production routes.
+"tests/**" = ["B008"]

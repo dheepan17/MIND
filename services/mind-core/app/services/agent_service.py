@@ -1,0 +1,262 @@
+"""AgentService — business boundary for agent operations (Phase 4.4).
+
+Wraps :class:`AgentRepository` with validation, typed errors, and audit
+logging. It contains no SQL, creates no connections, and never commits or
+rolls back — the caller owns the transaction (see :class:`BaseService`).
+
+Authorization boundary
+----------------------
+The current capability catalog (``read | write | shell | network |
+data:pii | admin:roles``) defines **no** agent-lifecycle capability (e.g.
+no ``agent:create`` or ``agent:manage``). Per the Phase 4.4 spec, this
+service therefore does NOT invoke :class:`PermissionService` for agent
+operations: those operations are unconditionally callable at the service
+layer until an explicit agent-management capability is introduced. The
+boundary is documented here rather than inventing policy. When such a
+capability exists, callers can compose
+``PermissionService.require_capability(...)`` inside their transaction, or
+this service can be extended to require it. (See test
+``test_no_agent_capability_policy_enforced``.)
+
+Audit actor
+-----------
+``audit_logs.actor_id`` is ``NOT NULL`` (schema 0001), so every audited
+method requires the caller to identify the principal via ``actor_type``
+(``agent`` | ``human`` | ``role``) and ``actor_id``. The service never
+invents an actor identity.
+"""
+from __future__ import annotations
+
+import uuid
+
+from app.repositories.agents import AgentRepository
+from app.services.audit_service import AuditService
+from app.services.base import BaseService
+from app.services.errors import NotFoundError, ValidationError
+
+_VALID_STATUSES = ("active", "suspended", "retired")
+_VALID_ACTOR_TYPES = ("agent", "human", "role")
+_MIN_AUTONOMY = 0
+_MAX_AUTONOMY = 2
+_MAX_LIMIT = 100
+
+
+def _require_uuid(value, field: str) -> str:
+    """Validate a non-empty, well-formed UUID (str or uuid.UUID)."""
+    if isinstance(value, uuid.UUID):
+        value = str(value)
+    if not isinstance(value, str) or not value:
+        raise ValidationError(f"{field} is required.")
+    try:
+        uuid.UUID(value)
+    except (ValueError, AttributeError, TypeError):
+        raise ValidationError(f"{field} must be a valid UUID.") from None
+    return value
+
+
+def _require_nonempty(value: str, field: str) -> str:
+    """Validate a required, non-empty string field."""
+    if not isinstance(value, str) or not value:
+        raise ValidationError(f"{field} is required.")
+    return value
+
+
+class AgentService(BaseService):
+    """Business boundary for creating, reading, and mutating agents.
+
+    Inherits the injected connection from :class:`BaseService`. Builds the
+    agent repository and an :class:`AuditService` on that same connection so
+    all work shares the caller's transaction. No connection is created and
+    no transaction is committed or rolled back here.
+    """
+
+    def __init__(self, conn) -> None:
+        super().__init__(conn)
+        # AuditService shares this service's connection and therefore the
+        # caller's transaction. No connection is created here.
+        self._audit = AuditService(conn)
+
+    # ── 1. create ──────────────────────────────────────────
+    def create(
+        self,
+        owner: str,
+        purpose: str,
+        autonomy_level: int = 0,
+        primary_role_id: str | None = None,
+        status: str = "active",
+        *,
+        actor_type: str = "agent",
+        actor_id: str,
+    ) -> dict:
+        """Create an agent and audit the creation.
+
+        ``actor_type``/``actor_id`` identify the principal performing the
+        action (required; ``audit_logs.actor_id`` is ``NOT NULL``). They are
+        not used for authorization (see module docstring).
+        """
+        _require_nonempty(owner, "owner")
+        _require_nonempty(purpose, "purpose")
+        self._validate_autonomy(autonomy_level)
+        if primary_role_id is not None:
+            _require_uuid(primary_role_id, "primary_role_id")
+        self._validate_status(status)
+        self._validate_actor(actor_type, actor_id)
+
+        agent = self.repository(AgentRepository).create(
+            owner=owner,
+            purpose=purpose,
+            autonomy_level=autonomy_level,
+            primary_role_id=primary_role_id,
+            status=status,
+        )
+        # Audit within the same caller-owned transaction as the insert.
+        self._audit.record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="agent.create",
+            outcome="success",
+            target_type="agent",
+            target_id=agent["id"],
+            context={"status": status},
+        )
+        return agent
+
+    # ── 2. get ─────────────────────────────────────────────
+    def get(self, agent_id: str) -> dict:
+        """Return the agent with ``agent_id`` or raise :class:`NotFoundError`."""
+        _require_uuid(agent_id, "agent_id")
+        agent = self.repository(AgentRepository).get(agent_id)
+        if agent is None:
+            raise NotFoundError(f"Agent '{agent_id}' does not exist.")
+        return agent
+
+    # ── 3. update_status ───────────────────────────────────
+    def update_status(
+        self,
+        agent_id: str,
+        status: str,
+        *,
+        actor_type: str = "agent",
+        actor_id: str,
+    ) -> dict:
+        """Update an agent's status and audit the mutation.
+
+        Raises :class:`NotFoundError` if the agent does not exist and
+        :class:`ValidationError` for an invalid status.
+        """
+        _require_uuid(agent_id, "agent_id")
+        self._validate_status(status)
+        self._validate_actor(actor_type, actor_id)
+        agent = self.repository(AgentRepository).get(agent_id)
+        if agent is None:
+            raise NotFoundError(f"Agent '{agent_id}' does not exist.")
+        self.repository(AgentRepository).update_status(agent_id, status)
+        self._audit.record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="agent.update_status",
+            outcome="success",
+            target_type="agent",
+            target_id=agent_id,
+            context={"status": status},
+        )
+        # Return the updated row for caller convenience.
+        return self.repository(AgentRepository).get(agent_id)
+
+    # ── 4. update_autonomy_level ───────────────────────────
+    def update_autonomy_level(
+        self,
+        agent_id: str,
+        autonomy_level: int,
+        *,
+        actor_type: str = "agent",
+        actor_id: str,
+    ) -> dict:
+        """Update an agent's stored autonomy level and audit the mutation.
+
+        The level is stored only; interpretation belongs to the
+        authorization layer. Raises :class:`NotFoundError` for a missing
+        agent and :class:`ValidationError` for an out-of-range level.
+        """
+        _require_uuid(agent_id, "agent_id")
+        self._validate_autonomy(autonomy_level)
+        self._validate_actor(actor_type, actor_id)
+        agent = self.repository(AgentRepository).get(agent_id)
+        if agent is None:
+            raise NotFoundError(f"Agent '{agent_id}' does not exist.")
+        self.repository(AgentRepository).update_autonomy_level(
+            agent_id, autonomy_level
+        )
+        self._audit.record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action="agent.update_autonomy_level",
+            outcome="success",
+            target_type="agent",
+            target_id=agent_id,
+            context={"autonomy_level": autonomy_level},
+        )
+        return self.repository(AgentRepository).get(agent_id)
+
+    # ── 5. list_by_owner ───────────────────────────────────
+    def list_by_owner(
+        self, owner: str, *, limit: int = 50, offset: int = 0
+    ) -> list[dict]:
+        """List agents owned by ``owner``, newest first."""
+        _require_nonempty(owner, "owner")
+        self._validate_paging(limit, offset)
+        return self.repository(AgentRepository).list_by_owner(
+            owner, limit=limit, offset=offset
+        )
+
+    # ── 6. list_by_role ────────────────────────────────────
+    def list_by_role(
+        self, role_id: str, *, limit: int = 50, offset: int = 0
+    ) -> list[dict]:
+        """List agents whose primary role is ``role_id``, newest first."""
+        _require_uuid(role_id, "role_id")
+        self._validate_paging(limit, offset)
+        return self.repository(AgentRepository).list_by_role(
+            role_id, limit=limit, offset=offset
+        )
+
+    # ── validation helpers ─────────────────────────────────
+    @staticmethod
+    def _validate_status(status: str) -> None:
+        if status not in _VALID_STATUSES:
+            raise ValidationError(
+                f"status must be one of {_VALID_STATUSES}; got {status!r}."
+            )
+
+    @staticmethod
+    def _validate_actor(actor_type: str, actor_id: str) -> None:
+        if actor_type not in _VALID_ACTOR_TYPES:
+            raise ValidationError(
+                f"actor_type must be one of {_VALID_ACTOR_TYPES}; "
+                f"got {actor_type!r}."
+            )
+        _require_nonempty(actor_id, "actor_id")
+
+    @staticmethod
+    def _validate_autonomy(level: int) -> None:
+        # bool is a subclass of int; reject it explicitly.
+        if not isinstance(level, int) or isinstance(level, bool):
+            raise ValidationError("autonomy_level must be an int.")
+        if level < _MIN_AUTONOMY or level > _MAX_AUTONOMY:
+            raise ValidationError(
+                f"autonomy_level must be between {_MIN_AUTONOMY} and "
+                f"{_MAX_AUTONOMY}; got {level}."
+            )
+
+    @staticmethod
+    def _validate_paging(limit: int, offset: int) -> None:
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValidationError("limit must be an int.")
+        if limit < 1 or limit > _MAX_LIMIT:
+            raise ValidationError(
+                f"limit must be an int between 1 and {_MAX_LIMIT}."
+            )
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValidationError("offset must be an int.")
+        if offset < 0:
+            raise ValidationError("offset must be an int >= 0.")
