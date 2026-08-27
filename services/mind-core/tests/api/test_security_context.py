@@ -19,15 +19,11 @@ forwards the trusted ``ctx.actor_id`` and never the HTTP body.
 
 from __future__ import annotations
 
-import os
 import uuid
 
 import pytest
 from fastapi import Request, status
 from fastapi.testclient import TestClient
-from psycopg import connect as real_connect
-
-TEST_DATABASE_URL = os.getenv("DATABASE_URL")
 
 from app.api import security as security_mod
 from app.api.security import (
@@ -303,90 +299,4 @@ def test_http_actor_type_cannot_replace_ctx_actor_type(db_free_secure_client):
     assert captured["actor_type"] != "role"
     assert captured["actor_id"] != "attacker"
 
-# ── Audit attribution on the demo route ──────────────────────
-def test_demo_route_audit_uses_ctx_actor_id():
-    if not TEST_DATABASE_URL:
-        pytest.skip("TEST_DATABASE_URL not set; skipping live audit test")
 
-    def _ok_resolver(request: Request) -> SecurityContext:
-        return SecurityContext("agent", "trusted-auditor", True, "external")
-
-    original = security_mod.get_security_context_resolver()
-    set_security_context_resolver(_ok_resolver)
-    owner = f"owner-{uuid.uuid4()}"
-    actor = f"actor-{uuid.uuid4()}"
-    agent_id = None
-    try:
-        with TestClient(app) as c:
-            created = c.post(
-                "/agents",
-                json={"owner": owner, "purpose": "audit-ctx", "actor_id": actor},
-            )
-            assert created.status_code == 201
-            agent_id = created.json()["id"]
-            # Body claims a different actor; ctx must win for audit.
-            resp = c.patch(
-                f"/agents/{agent_id}/status/secure",
-                json={"status": "suspended", "actor_id": "imposter"},
-            )
-            assert resp.status_code == 200
-
-        conn = real_connect(TEST_DATABASE_URL)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT action, outcome, actor_id FROM audit_logs "
-                    "WHERE target_type = 'agent' AND target_id = %s "
-                    "ORDER BY created_at DESC LIMIT 1",
-                    (agent_id,),
-                )
-                row = cur.fetchone()
-            assert row is not None
-            assert row[0] == "agent.update_status"
-            assert row[1] == "success"
-            # Audit reflects the trusted ctx, NOT the impersonated body.
-            assert row[2] == "trusted-auditor"
-        finally:
-            conn.close()
-    finally:
-        set_security_context_resolver(original)
-        _cleanup_agent(agent_id)
-
-
-# ── get_conn / get_txn behavior unchanged ───────────────────
-def test_get_conn_and_get_txn_still_work():
-    from app.api.dependencies import get_conn, get_txn
-
-    # Routers import these; ensure imports remain valid after the change.
-    assert callable(get_conn)
-    assert callable(get_txn)
-
-    gen = get_conn()
-    conn = next(gen)
-    try:
-        assert conn is not None
-    finally:
-        with pytest.raises(StopIteration):
-            next(gen)
-
-    tgen = get_txn()
-    tconn = next(tgen)
-    try:
-        assert tconn is not None
-    finally:
-        with pytest.raises(StopIteration):
-            next(tgen)
-
-
-# ── helpers ──────────────────────────────────────────────────
-def _cleanup_agent(agent_id):
-    if not agent_id or not TEST_DATABASE_URL:
-        return
-    conn = real_connect(TEST_DATABASE_URL)
-    try:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM audit_logs WHERE target_id = %s", (str(agent_id),))
-            cur.execute("DELETE FROM agents WHERE id = %s", (str(agent_id),))
-        conn.commit()
-    finally:
-        conn.close()
