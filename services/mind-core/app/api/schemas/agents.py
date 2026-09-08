@@ -19,8 +19,8 @@ class CreateAgentRequest(BaseModel):
     """Body for ``POST /agents``.
 
     Only fields actually accepted by ``AgentService.create`` are present.
-    ``actor_type`` defaults to ``"agent"`` to match the service default;
-    ``actor_id`` is required because ``audit_logs.actor_id`` is NOT NULL.
+    Caller identity (``actor_id``/``actor_type``) is supplied by the trusted
+    :class:`SecurityContext`, never the request body (Phase 5.8).
     """
 
     owner: str
@@ -28,24 +28,24 @@ class CreateAgentRequest(BaseModel):
     autonomy_level: int = 0
     primary_role_id: str | None = None
     status: str = "active"
-    actor_type: str = "agent"
-    actor_id: str
 
 
 class UpdateStatusRequest(BaseModel):
-    """Body for ``PATCH /agents/{id}/status``."""
+    """Body for ``PATCH /agents/{id}/status``.
+
+    Caller identity is supplied by the trusted SecurityContext, not the body.
+    """
 
     status: str
-    actor_type: str = "agent"
-    actor_id: str
 
 
 class UpdateAutonomyRequest(BaseModel):
-    """Body for ``PATCH /agents/{id}/autonomy-level``."""
+    """Body for ``PATCH /agents/{id}/autonomy-level``.
+
+    Caller identity is supplied by the trusted SecurityContext, not the body.
+    """
 
     autonomy_level: int
-    actor_type: str = "agent"
-    actor_id: str
 
 
 class AgentResponse(BaseModel):

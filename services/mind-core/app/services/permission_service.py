@@ -27,6 +27,12 @@ from app.repositories.permissions import PermissionRepository
 from app.services.base import BaseService
 from app.services.errors import AuthorizationError, NotFoundError, ValidationError
 
+# Generic write capability (Phase 5.8 authorization boundary). Per the approved
+# Phase 5.7A security policy, resource mutations are gated on this single
+# generic capability; no resource-scoped capabilities (agent:create, task:create,
+# memory:create, …) are invented.
+WRITE_CAPABILITY = "write"
+
 
 class PermissionService(BaseService):
     """Authorization boundary for agents, roles, and capabilities.
@@ -98,6 +104,17 @@ class PermissionService(BaseService):
                 f"Agent '{agent_id}' is not authorized for capability "
                 f"'{capability}'."
             )
+
+    # ── 3b. generic write gate (Phase 5.8) ────────────────
+    def require_write(self, agent_id: str) -> None:
+        """Raise :class:`AuthorizationError` unless the agent holds ``write``.
+
+        Thin, intent-revealing wrapper over :meth:`require_capability` for the
+        generic resource-mutation capability. The agent id is the trusted
+        ``SecurityContext.actor_id`` passed down by routers — never a
+        client-supplied body/query field.
+        """
+        self.require_capability(agent_id, WRITE_CAPABILITY)
 
     # ── 4. grant a direct capability ────────────────────────
     def grant_capability(

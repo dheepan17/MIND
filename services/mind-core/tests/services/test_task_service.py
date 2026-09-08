@@ -40,6 +40,21 @@ def agents(db):
     return AgentRepository(db)
 
 
+@pytest.fixture
+def perms(db):
+    from app.repositories.permissions import PermissionRepository
+
+    return PermissionRepository(db)
+
+
+def _make_role_cap(perms, role_name, cap_key):
+    """Create a role, a capability, and assign the cap to the role."""
+    role = perms.create_role(role_name)
+    cap = perms.create_capability(cap_key)
+    perms.assign_capability_to_role(role["id"], cap["id"])
+    return role, cap
+
+
 def _uid(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4()}"
 
@@ -387,11 +402,42 @@ def test_repository_is_used(monkeypatch, service, agents):
 
 
 # ── 31. no task-lifecycle capability policy enforced ────
-def test_no_task_capability_policy_enforced(service, agents):
-    # The current capability catalog defines no task capability, so task
-    # operations are unconditionally callable at the service layer. This
-    # documents the boundary rather than inventing policy.
-    task = _make_task(service, agents)
+def test_write_capability_policy_enforced(service, perms, agents):
+    # Phase 5.8 authorization boundary: task mutations are gated on the
+    # generic ``write`` capability (no resource-scoped capability invented).
+    # An actor WITHOUT ``write`` is denied; WITH ``write`` it succeeds.
+    from app.services import AuthorizationError
+
+    # Writer agent inherits ``write`` through a role.
+    role, _cap = _make_role_cap(perms, "writer", "write")
+    writer = agents.create(
+        owner=_uid("owner"), purpose="p", primary_role_id=role["id"]
+    )
+    no_write = _make_agent(agents)
+
+    # Actor lacking ``write`` is denied (no task is created).
+    with pytest.raises(AuthorizationError):
+        service.create(title=_uid("task"), actor_id=no_write["id"])
+
+    # An existing task cannot be mutated by an actor lacking ``write``.
+    task = _make_task(service, agents, actor_id=writer["id"])
+    with pytest.raises(AuthorizationError):
+        service.update_status(
+            task["id"], "running", actor_id=no_write["id"]
+        )
+
+    # Actor WITH ``write`` succeeds.
+    task = _make_task(service, agents, actor_id=writer["id"])
     assert task["id"] is not None
-    updated = service.update_status(task["id"], "running", actor_id=ACTOR)
+    updated = service.update_status(task["id"], "running", actor_id=writer["id"])
     assert updated["status"] == "running"
+
+    # A denial audit row exists for the unauthorized create attempt.
+    audit = AuditService(service._conn)
+    denied = [
+        r
+        for r in audit.list_by_actor("agent", no_write["id"])
+        if r["action"] == "task.create" and r["outcome"] == "denied"
+    ]
+    assert denied, "expected a denied audit record for the unauthorized create"
+    assert denied[0]["capability_used"] == "write"

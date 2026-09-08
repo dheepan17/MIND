@@ -34,6 +34,7 @@ from app.api.schemas.memories import (
     MemoryResponse,
     UpdateMemoryRequest,
 )
+from app.api.security import SecurityContext, get_security_context
 from app.services.errors import PolicyViolationError
 from app.services.memory_service import MemoryService
 
@@ -52,8 +53,15 @@ _SECRET_CLASSIFICATION = "secret"
 
 
 @router.post("", response_model=MemoryResponse, status_code=201)
-def create_memory(body: CreateMemoryRequest, conn: Txn) -> dict:
-    """Create a memory. Delegates all validation/audit to MemoryService."""
+def create_memory(
+    body: CreateMemoryRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
+    """Create a memory. Delegates all validation/audit to MemoryService.
+
+    Caller identity comes from the trusted SecurityContext (Phase 5.8).
+    """
     if body.classification == _SECRET_CLASSIFICATION:
         raise PolicyViolationError("secret classification is not exposed over the HTTP API")
     service = MemoryService(conn)
@@ -64,8 +72,8 @@ def create_memory(body: CreateMemoryRequest, conn: Txn) -> dict:
         classification=body.classification,
         embedding=body.embedding,
         metadata=body.metadata,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 
@@ -110,7 +118,12 @@ def get_memory(memory_id: str, conn: Conn) -> dict:
 
 
 @router.patch("/{memory_id}", response_model=MemoryResponse)
-def update_memory(memory_id: str, body: UpdateMemoryRequest, conn: Txn) -> dict:
+def update_memory(
+    memory_id: str,
+    body: UpdateMemoryRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
     """Update a memory. Delegates all validation/audit to MemoryService."""
     if body.classification == _SECRET_CLASSIFICATION:
         raise PolicyViolationError("secret classification is not exposed over the HTTP API")
@@ -121,28 +134,26 @@ def update_memory(memory_id: str, body: UpdateMemoryRequest, conn: Txn) -> dict:
         classification=body.classification,
         embedding=body.embedding,
         metadata=body.metadata,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 
 @router.delete("/{memory_id}", response_model=MemoryResponse)
 def delete_memory(
     memory_id: str,
-    actor_type: str = Query("agent"),
-    actor_id: str = Query(..., min_length=1),
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
     conn: Txn = None,
 ) -> dict:
     """Soft-delete a memory. Delegates audit to MemoryService.
 
-    The audit actor is supplied as query parameters because the test
-    client's ``DELETE`` does not carry a body; ``actor_id`` is required
-    (``audit_logs.actor_id`` is ``NOT NULL``). Repeated deletes resolve to
-    404 (the row is already soft-deleted and thus invisible to the
+    Caller identity comes from the trusted SecurityContext (Phase 5.8); the
+    DELETE body/query no longer carries the audit actor. Repeated deletes
+    resolve to 404 (the row is already soft-deleted and thus invisible to the
     service's lookup). No hard delete occurs.
     """
     return MemoryService(conn).soft_delete(
         memory_id,
-        actor_type=actor_type,
-        actor_id=actor_id,
+        actor_type=ctx.actor_type,
+        actor_id=ctx.actor_id,
     )

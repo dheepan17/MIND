@@ -8,14 +8,15 @@ transaction (see :class:`app.services.base.BaseService`).
 Authorization boundary
 ----------------------
 The current capability catalog (``read | write | shell | network |
-data:pii | admin:roles``) defines **no** job-lifecycle capability (e.g.
-``job:create`` / ``job:run``). Following the same pattern as
-``AgentService`` (Phase 4.4) and ``TaskService`` (Phase 4.5), this
-service does NOT gate job operations on a capability. When such
-capabilities are introduced, callers can compose
-``PermissionService.require_capability(...)`` inside their transaction,
-or this service can be extended to require them — no schema change is
-needed. We deliberately do not invent a ``job:*`` capability here.
+data:pii | admin:roles``) defines **no** *resource-scoped* job capability
+(e.g. ``job:create`` / ``job:run``). Per the approved Phase 5.7A security
+policy, every job *mutation* is instead gated on the generic ``write``
+capability. Authorization occurs **inside** the caller-owned transaction,
+**before** the mutation, via ``PermissionService.require_write(...)`` using
+the *trusted* ``SecurityContext.actor_id`` supplied by the router. A missing
+``write`` capability raises :class:`AuthorizationError` (HTTP 403); the denial
+is recorded in ``audit_logs`` with ``outcome='denied'`` and
+``capability_used='write'``. No resource-scoped ``job:*`` capability is invented.
 
 Schema notes (migration 0001)
 -----------------------------
@@ -51,7 +52,8 @@ from app.repositories.tasks import TaskRepository
 from app.repositories.tools import ToolRepository
 from app.services.audit_service import AuditService
 from app.services.base import BaseService
-from app.services.errors import NotFoundError, ValidationError
+from app.services.errors import AuthorizationError, NotFoundError, ValidationError
+from app.services.permission_service import PermissionService
 
 _VALID_STATUSES = (
     "queued",
@@ -74,6 +76,42 @@ def _is_uuid(value: str) -> bool:
 
 class JobService(BaseService):
     """Business boundary for job lifecycle operations."""
+
+    def __init__(self, conn) -> None:
+        super().__init__(conn)
+        # PermissionService shares this service's connection and therefore the
+        # caller's transaction. It owns the generic ``write`` capability check
+        # (Phase 5.8).
+        self._perms = PermissionService(conn)
+
+    # ── authorization helpers (Phase 5.8) ───────────────────
+    def _require_write(self, actor_id: str) -> None:
+        """Gate a mutation on the generic ``write`` capability.
+
+        ``actor_id`` is the trusted ``SecurityContext.actor_id`` supplied by the
+        router — never a client-supplied body/query field. Raises
+        :class:`AuthorizationError` (HTTP 403) when the capability is absent.
+        """
+        self._perms.require_write(actor_id)
+
+    def _audit_denied(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        action: str,
+        target_id: str | None,
+    ) -> None:
+        """Record a denied job mutation (missing/insufficient capability)."""
+        AuditService(self._conn).record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action=action,
+            outcome="denied",
+            target_type="job",
+            target_id=target_id,
+            capability_used="write",
+        )
 
     # ── helpers ───────────────────────────────────────────
     def _require_job(self, job_id: str) -> dict:
@@ -163,6 +201,18 @@ class JobService(BaseService):
         if tool_id is not None:
             self._require_tool(tool_id)
 
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="job.create",
+                target_id=None,
+            )
+            raise
+
         job = self.repository(JobRepository).create(
             task_id=task_id,
             agent_id=agent_id,
@@ -200,6 +250,17 @@ class JobService(BaseService):
                 f"actor_type must be one of {_VALID_ACTOR_TYPES}."
             )
         self._require_job(job_id)
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="job.mark_started",
+                target_id=job_id,
+            )
+            raise
         # Repository owns status='running' and started_at=now().
         self.repository(JobRepository).mark_started(job_id)
         self._audit(
@@ -227,6 +288,17 @@ class JobService(BaseService):
                 f"actor_type must be one of {_VALID_ACTOR_TYPES}."
             )
         self._require_job(job_id)
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="job.mark_finished",
+                target_id=job_id,
+            )
+            raise
         # Repository owns status='succeeded', finished_at=now(), result.
         # The result body is intentionally NOT placed in the audit context
         # (redaction policy).
@@ -258,6 +330,17 @@ class JobService(BaseService):
         if error is not None and not isinstance(error, str):
             raise ValidationError("error must be a string or None.")
         self._require_job(job_id)
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="job.mark_failed",
+                target_id=job_id,
+            )
+            raise
         # Repository owns status='failed', finished_at=now(), error.
         # The error body is intentionally NOT placed in the audit context
         # (redaction policy).
@@ -342,6 +425,18 @@ class JobService(BaseService):
                 "Only failed jobs can be retried."
             )
 
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="job.retry",
+                target_id=job_id,
+            )
+            raise
+
         self.repository(JobRepository).retry(job_id)
 
         self._audit(
@@ -368,6 +463,17 @@ class JobService(BaseService):
                 f"actor_type must be one of {_VALID_ACTOR_TYPES}."
             )
         self._require_job(job_id)
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="job.increment_retry",
+                target_id=job_id,
+            )
+            raise
         # Repository performs retry_count = retry_count + 1 atomically.
         # The service does NOT recompute the counter.
         self.repository(JobRepository).increment_retry(job_id)

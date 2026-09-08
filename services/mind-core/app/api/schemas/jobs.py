@@ -22,14 +22,12 @@ class CreateJobRequest(BaseModel):
     """Body for ``POST /jobs``.
 
     Only fields actually accepted by ``JobService.create`` are present.
-    ``actor_type`` defaults to ``"agent"`` to match the service default;
-    ``actor_id`` is required because ``audit_logs.actor_id`` is NOT NULL.
     ``task_id``/``agent_id``/``tool_id`` are optional links; the service
-    enforces existence only when a value is supplied.
+    enforces existence only when a value is supplied. Caller identity
+    (``actor_id``/``actor_type``) is supplied by the trusted SecurityContext,
+    never the request body (Phase 5.8).
     """
 
-    actor_id: str
-    actor_type: str = "agent"
     task_id: str | None = None
     agent_id: str | None = None
     tool_id: str | None = None
@@ -38,33 +36,35 @@ class CreateJobRequest(BaseModel):
 
 
 class StartJobRequest(BaseModel):
-    """Body for ``POST /jobs/{id}/start``."""
+    """Body for ``POST /jobs/{id}/start``.
 
-    actor_id: str
-    actor_type: str = "agent"
+    Caller identity is supplied by the trusted SecurityContext, not the body.
+    """
 
 
 class FinishJobRequest(BaseModel):
-    """Body for ``POST /jobs/{id}/finish``."""
+    """Body for ``POST /jobs/{id}/finish``.
+
+    Caller identity is supplied by the trusted SecurityContext, not the body.
+    """
 
     result: object | None = None
-    actor_id: str
-    actor_type: str = "agent"
 
 
 class FailJobRequest(BaseModel):
-    """Body for ``POST /jobs/{id}/fail``."""
+    """Body for ``POST /jobs/{id}/fail``.
+
+    Caller identity is supplied by the trusted SecurityContext, not the body.
+    """
 
     error: str | None = None
-    actor_id: str
-    actor_type: str = "agent"
 
 
 class RetryJobRequest(BaseModel):
-    """Body for ``POST /jobs/{id}/retry``."""
+    """Body for ``POST /jobs/{id}/retry``.
 
-    actor_id: str
-    actor_type: str = "agent"
+    Caller identity is supplied by the trusted SecurityContext, not the body.
+    """
 
 
 class JobResponse(BaseModel):

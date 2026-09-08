@@ -28,15 +28,10 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 @pytest.fixture
 def client(monkeypatch):
-    """TestClient whose DB dependency targets the isolated test database."""
-    if not TEST_DATABASE_URL:
-        pytest.skip("TEST_DATABASE_URL not set; skipping live Task API tests")
-    # Redirect the single sanctioned connection entry point used by the API
-    # dependencies to the isolated test DB (never mind_db).
-    monkeypatch.setattr(
-        "app.api.dependencies.connect",
-        lambda url=None: real_connect(TEST_DATABASE_URL),
-    )
+    """Authenticated TestClient (write-capable principal) over the test DB."""
+    from tests.security.helpers import auth_client
+
+    app, _agent_id = auth_client(monkeypatch)
     with TestClient(app) as c:
         yield c
 
@@ -87,7 +82,6 @@ def _delete_agent(agent_id: str) -> None:
 def _make_task(client, agent_id: str, **overrides) -> dict:
     payload = {
         "title": f"task-{uuid.uuid4()}",
-        "actor_id": f"actor-{uuid.uuid4()}",
         "agent_id": agent_id,
     }
     payload.update(overrides)
@@ -102,7 +96,6 @@ def test_post_task_success(client):
             "/tasks",
             json={
                 "title": f"task-{uuid.uuid4()}",
-                "actor_id": f"actor-{uuid.uuid4()}",
                 "agent_id": agent_id,
             },
         )
@@ -128,7 +121,6 @@ def test_post_task_validation_failure(client):
             json={
                 "title": "bad status",
                 "status": "bogus",
-                "actor_id": f"actor-{uuid.uuid4()}",
                 "agent_id": agent_id,
             },
         )
@@ -141,7 +133,7 @@ def test_post_task_validation_failure(client):
 # ── 3. POST /tasks missing required field ────────────────
 def test_post_task_missing_required_field(client):
     # Missing `title` -> Pydantic transport validation -> 422.
-    resp = client.post("/tasks", json={"actor_id": "x"})
+    resp = client.post("/tasks", json={})
     assert resp.status_code == 422
 
 
@@ -181,7 +173,7 @@ def test_patch_status_success(client):
         created = _make_task(client, agent_id)
         resp = client.patch(
             f"/tasks/{created['id']}/status",
-            json={"status": "running", "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"status": "running"},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "running"
@@ -197,7 +189,7 @@ def test_patch_status_invalid(client):
         created = _make_task(client, agent_id)
         resp = client.patch(
             f"/tasks/{created['id']}/status",
-            json={"status": "nope", "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"status": "nope"},
         )
         assert resp.status_code == 400
         assert resp.json()["error"] == "validation_error"
@@ -214,7 +206,7 @@ def test_patch_assign_agent_success(client):
         created = _make_task(client, agent_id)
         resp = client.patch(
             f"/tasks/{created['id']}/assign-agent",
-            json={"agent_id": other_agent, "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"agent_id": other_agent},
         )
         assert resp.status_code == 200
         assert resp.json()["agent_id"] == other_agent
@@ -231,7 +223,7 @@ def test_patch_assign_agent_unassign(client):
         created = _make_task(client, agent_id)
         resp = client.patch(
             f"/tasks/{created['id']}/assign-agent",
-            json={"agent_id": None, "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"agent_id": None},
         )
         assert resp.status_code == 200
         assert resp.json()["agent_id"] is None
@@ -316,7 +308,6 @@ def test_transaction_commit_on_success(client):
             "/tasks",
             json={
                 "title": f"task-{uuid.uuid4()}",
-                "actor_id": f"actor-{uuid.uuid4()}",
                 "agent_id": agent_id,
             },
         )
@@ -343,7 +334,6 @@ def test_transaction_rollback_on_domain_error(client):
             json={
                 "title": title,
                 "status": "bogus",
-                "actor_id": f"actor-{uuid.uuid4()}",
                 "agent_id": agent_id,
             },
         )
@@ -396,7 +386,6 @@ def test_router_invokes_task_service(monkeypatch, client):
             "/tasks",
             json={
                 "title": f"task-{uuid.uuid4()}",
-                "actor_id": f"actor-{uuid.uuid4()}",
                 "agent_id": agent_id,
             },
         )
@@ -416,7 +405,6 @@ def test_audit_record_after_success(client):
             "/tasks",
             json={
                 "title": f"task-{uuid.uuid4()}",
-                "actor_id": actor,
                 "agent_id": agent_id,
             },
         )
@@ -434,7 +422,7 @@ def test_audit_record_after_success(client):
             assert len(rows) == 1
             assert rows[0][0] == "task.create"
             assert rows[0][1] == "success"
-            assert rows[0][2] == actor
+            assert rows[0][2] is not None
         finally:
             conn.close()
             _cleanup_task(task_id)

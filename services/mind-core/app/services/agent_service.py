@@ -6,17 +6,17 @@ rolls back — the caller owns the transaction (see :class:`BaseService`).
 
 Authorization boundary
 ----------------------
-The current capability catalog (``read | write | shell | network |
-data:pii | admin:roles``) defines **no** agent-lifecycle capability (e.g.
-no ``agent:create`` or ``agent:manage``). Per the Phase 4.4 spec, this
-service therefore does NOT invoke :class:`PermissionService` for agent
-operations: those operations are unconditionally callable at the service
-layer until an explicit agent-management capability is introduced. The
-boundary is documented here rather than inventing policy. When such a
-capability exists, callers can compose
-``PermissionService.require_capability(...)`` inside their transaction, or
-this service can be extended to require it. (See test
-``test_no_agent_capability_policy_enforced``.)
+Per the approved Phase 5.7A security policy, every agent *mutation* is gated
+on the generic ``write`` capability (catalog: ``read | write | shell |
+network | data:pii | admin:roles``). No resource-scoped capability (e.g.
+``agent:create`` / ``agent:manage``) is invented. Authorization occurs
+**inside** the caller-owned transaction, **before** the mutation, via
+``PermissionService.require_write(...)`` using the *trusted*
+``SecurityContext.actor_id`` supplied by the router. A missing ``write``
+capability raises :class:`AuthorizationError` (HTTP 403); the denial is
+recorded in ``audit_logs`` with ``outcome='denied'`` and
+``capability_used='write'``. ``data:pii`` enforcement and read/POST
+``/events`` authorization are explicitly out of scope for this phase.
 
 Audit actor
 -----------
@@ -32,7 +32,8 @@ import uuid
 from app.repositories.agents import AgentRepository
 from app.services.audit_service import AuditService
 from app.services.base import BaseService
-from app.services.errors import NotFoundError, ValidationError
+from app.services.errors import AuthorizationError, NotFoundError, ValidationError
+from app.services.permission_service import PermissionService
 
 _VALID_STATUSES = ("active", "suspended", "retired")
 _VALID_ACTOR_TYPES = ("agent", "human", "role")
@@ -75,6 +76,39 @@ class AgentService(BaseService):
         # AuditService shares this service's connection and therefore the
         # caller's transaction. No connection is created here.
         self._audit = AuditService(conn)
+        # PermissionService shares the same connection/transaction. It owns the
+        # generic ``write`` capability check (Phase 5.8).
+        self._perms = PermissionService(conn)
+
+    # ── authorization helpers (Phase 5.8) ───────────────────
+    def _require_write(self, actor_id: str) -> None:
+        """Gate a mutation on the generic ``write`` capability.
+
+        ``actor_id`` is the trusted ``SecurityContext.actor_id`` supplied by the
+        router — never a client-supplied body/query field. Raises
+        :class:`AuthorizationError` (HTTP 403) when the capability is absent.
+        """
+        self._perms.require_write(actor_id)
+
+    def _audit_denied(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        action: str,
+        target_type: str,
+        target_id: str | None,
+    ) -> None:
+        """Record a denied mutation (missing/insufficient capability)."""
+        self._audit.record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action=action,
+            outcome="denied",
+            target_type=target_type,
+            target_id=target_id,
+            capability_used="write",
+        )
 
     # ── 1. create ──────────────────────────────────────────
     def create(
@@ -101,6 +135,19 @@ class AgentService(BaseService):
             _require_uuid(primary_role_id, "primary_role_id")
         self._validate_status(status)
         self._validate_actor(actor_type, actor_id)
+
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="agent.create",
+                target_type="agent",
+                target_id=None,
+            )
+            raise
 
         agent = self.repository(AgentRepository).create(
             owner=owner,
@@ -150,6 +197,18 @@ class AgentService(BaseService):
         agent = self.repository(AgentRepository).get(agent_id)
         if agent is None:
             raise NotFoundError(f"Agent '{agent_id}' does not exist.")
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="agent.update_status",
+                target_type="agent",
+                target_id=agent_id,
+            )
+            raise
         self.repository(AgentRepository).update_status(agent_id, status)
         self._audit.record(
             actor_type=actor_type,
@@ -184,6 +243,18 @@ class AgentService(BaseService):
         agent = self.repository(AgentRepository).get(agent_id)
         if agent is None:
             raise NotFoundError(f"Agent '{agent_id}' does not exist.")
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="agent.update_autonomy_level",
+                target_type="agent",
+                target_id=agent_id,
+            )
+            raise
         self.repository(AgentRepository).update_autonomy_level(
             agent_id, autonomy_level
         )

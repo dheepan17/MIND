@@ -38,6 +38,19 @@ def perms(db):
     return PermissionRepository(db)
 
 
+@pytest.fixture
+def agents(db):
+    return AgentRepository(db)
+
+
+def _make_role_cap(perms, role_name, cap_key):
+    """Create a role, a capability, and assign the cap to the role."""
+    role = perms.create_role(role_name)
+    cap = perms.create_capability(cap_key)
+    perms.assign_capability_to_role(role["id"], cap["id"])
+    return role, cap
+
+
 def _make_agent(service, **overrides):
     """Create an agent through the service with sensible defaults."""
     payload = {
@@ -47,6 +60,11 @@ def _make_agent(service, **overrides):
     }
     payload.update(overrides)
     return service.create(**payload)
+
+
+def _make_agent_raw(agents, role_id=None):
+    """Create a bare agent (via repository) for capability-seeding tests."""
+    return agents.create(owner=OWNER, purpose="p", primary_role_id=role_id)
 
 
 # ── 1. create agent ──────────────────────────────────────
@@ -261,16 +279,46 @@ def test_repository_is_used(monkeypatch, service):
 
 
 # ── 21. no agent-lifecycle capability policy is enforced ─
-def test_no_agent_capability_policy_enforced(service):
-    # The current capability catalog defines no agent-management
-    # capability, so agent operations are unconditionally callable at the
-    # service layer. This documents the boundary rather than inventing
-    # policy: a plain create must NOT raise AuthorizationError.
-    agent = _make_agent(service)
+def test_write_capability_policy_enforced(service, perms, agents):
+    # Phase 5.8 authorization boundary: agent mutations are gated on the
+    # generic ``write`` capability (no resource-scoped capability invented).
+    # An actor WITHOUT ``write`` must be denied; WITH ``write`` it succeeds.
+    from app.services import AuthorizationError
+
+    # Build a role that conveys the generic ``write`` capability and a separate
+    # actor with no capabilities.
+    role, _cap = _make_role_cap(perms, "writer", "write")
+    actor_writer = _make_agent_raw(agents, role_id=role["id"])
+    actor_no_write = _make_agent_raw(agents)
+
+    # Actor lacking ``write`` is denied at the service transaction boundary,
+    # and the denial is audited (separate, committed audit row).
+    with pytest.raises(AuthorizationError):
+        service.create(owner=OWNER, purpose="p", actor_id=actor_no_write["id"])
+    with pytest.raises(AuthorizationError):
+        service.update_status(
+            actor_no_write["id"], "suspended", actor_id=actor_no_write["id"]
+        )
+
+    # Actor WITH ``write`` is authorized.
+    agent = service.create(
+        owner=OWNER, purpose="p", actor_id=actor_writer["id"]
+    )
     assert agent["id"] is not None
-    # And a mutation on an existing agent is likewise not gated.
-    updated = service.update_status(agent["id"], "suspended", actor_id=ACTOR)
+    updated = service.update_status(
+        agent["id"], "suspended", actor_id=actor_writer["id"]
+    )
     assert updated["status"] == "suspended"
+
+    # A denial audit row exists for the unauthorized create attempt.
+    audit = AuditService(service._conn)
+    denied = [
+        r
+        for r in audit.list_by_actor("agent", actor_no_write["id"])
+        if r["action"] == "agent.create" and r["outcome"] == "denied"
+    ]
+    assert denied, "expected a denied audit record for the unauthorized create"
+    assert denied[0]["capability_used"] == "write"
 
 
 # ── audit atomicity: rollback removes both ──────────────

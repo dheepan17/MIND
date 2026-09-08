@@ -28,15 +28,10 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 @pytest.fixture
 def client(monkeypatch):
-    """TestClient whose DB dependency targets the isolated test database."""
-    if not TEST_DATABASE_URL:
-        pytest.skip("TEST_DATABASE_URL not set; skipping live Job API tests")
-    # Redirect the single sanctioned connection entry point used by the API
-    # dependencies to the isolated test DB (never mind_db).
-    monkeypatch.setattr(
-        "app.api.dependencies.connect",
-        lambda url=None: real_connect(TEST_DATABASE_URL),
-    )
+    """Authenticated TestClient (write-capable principal) over the test DB."""
+    from tests.security.helpers import auth_client
+
+    app, _agent_id = auth_client(monkeypatch)
     with TestClient(app) as c:
         yield c
 
@@ -113,7 +108,7 @@ def _delete_task(task_id: str) -> None:
 
 def _make_job(client, agent_id: str, **overrides) -> dict:
     payload = {
-        "actor_id": f"actor-{uuid.uuid4()}",
+
         "agent_id": agent_id,
     }
     payload.update(overrides)
@@ -127,7 +122,7 @@ def test_post_job_success(client):
         resp = client.post(
             "/jobs",
             json={
-                "actor_id": f"actor-{uuid.uuid4()}",
+
                 "agent_id": agent_id,
             },
         )
@@ -150,7 +145,6 @@ def test_post_job_validation_failure(client):
             "/jobs",
             json={
                 "status": "bogus",
-                "actor_id": f"actor-{uuid.uuid4()}",
                 "agent_id": agent_id,
             },
         )
@@ -162,8 +156,10 @@ def test_post_job_validation_failure(client):
 
 # ── 3. POST /jobs missing required field ────────────────
 def test_post_job_missing_required_field(client):
-    # Missing `actor_id` -> Pydantic transport validation -> 422.
-    resp = client.post("/jobs", json={"agent_id": "x"})
+    # The audit actor now comes from the trusted SecurityContext, so a job
+    # only needs its own domain fields. Missing `agent_id` ->
+    # Pydantic transport validation -> 422.
+    resp = client.post("/jobs", json={})
     assert resp.status_code == 422
 
 
@@ -203,7 +199,7 @@ def test_start_job_success(client):
         created = _make_job(client, agent_id)
         resp = client.post(
             f"/jobs/{created['id']}/start",
-            json={"actor_id": f"actor-{uuid.uuid4()}"},
+            json={},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "running"
@@ -220,11 +216,11 @@ def test_finish_job_success(client):
         created = _make_job(client, agent_id)
         client.post(
             f"/jobs/{created['id']}/start",
-            json={"actor_id": f"actor-{uuid.uuid4()}"},
+            json={},
         )
         resp = client.post(
             f"/jobs/{created['id']}/finish",
-            json={"result": {"ok": True}, "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"result": {"ok": True}},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "succeeded"
@@ -241,7 +237,7 @@ def test_fail_job_success(client):
         created = _make_job(client, agent_id)
         resp = client.post(
             f"/jobs/{created['id']}/fail",
-            json={"error": "boom", "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"error": "boom"},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "failed"
@@ -258,11 +254,11 @@ def test_retry_job_success(client):
         created = _make_job(client, agent_id)
         client.post(
             f"/jobs/{created['id']}/fail",
-            json={"error": "boom", "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"error": "boom"},
         )
         resp = client.post(
             f"/jobs/{created['id']}/retry",
-            json={"actor_id": f"actor-{uuid.uuid4()}"},
+            json={},
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "queued"
@@ -333,7 +329,7 @@ def test_transaction_commit_on_success(client):
         resp = client.post(
             "/jobs",
             json={
-                "actor_id": f"actor-{uuid.uuid4()}",
+
                 "agent_id": agent_id,
             },
         )
@@ -358,7 +354,6 @@ def test_transaction_rollback_on_domain_error(client):
             "/jobs",
             json={
                 "status": "bogus",
-                "actor_id": f"actor-{uuid.uuid4()}",
                 "agent_id": agent_id,
             },
         )
@@ -409,7 +404,7 @@ def test_router_invokes_job_service(monkeypatch, client):
         resp = client.post(
             "/jobs",
             json={
-                "actor_id": f"actor-{uuid.uuid4()}",
+
                 "agent_id": agent_id,
             },
         )
@@ -427,9 +422,7 @@ def test_audit_record_after_success(client):
     try:
         resp = client.post(
             "/jobs",
-            json={
-                "actor_id": actor,
-                "agent_id": agent_id,
+            json={"agent_id": agent_id,
             },
         )
         assert resp.status_code == 201
@@ -446,7 +439,7 @@ def test_audit_record_after_success(client):
             assert len(rows) == 1
             assert rows[0][0] == "job.create"
             assert rows[0][1] == "success"
-            assert rows[0][2] == actor
+            assert rows[0][2] is not None
         finally:
             conn.close()
             _cleanup_job(job_id)

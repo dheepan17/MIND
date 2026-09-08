@@ -34,15 +34,10 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 @pytest.fixture
 def client(monkeypatch):
-    """TestClient whose DB dependency targets the isolated test database."""
-    if not TEST_DATABASE_URL:
-        pytest.skip("TEST_DATABASE_URL not set; skipping live Memory API tests")
-    # Redirect the single sanctioned connection entry point used by the API
-    # dependencies to the isolated test DB (never mind_db).
-    monkeypatch.setattr(
-        "app.api.dependencies.connect",
-        lambda url=None: real_connect(TEST_DATABASE_URL),
-    )
+    """Authenticated TestClient (write-capable principal) over the test DB."""
+    from tests.security.helpers import auth_client
+
+    app, _agent_id = auth_client(monkeypatch)
     with TestClient(app) as c:
         yield c
 
@@ -106,8 +101,6 @@ def _create_memory(client, agent_id: str, **overrides) -> dict:
         "agent_id": agent_id,
         "type": "semantic",
         "content": f"memory-{uuid.uuid4()}",
-        "actor_type": "agent",
-        "actor_id": f"actor-{uuid.uuid4()}",
     }
     payload.update(overrides)
     return client.post("/memories", json=payload).json()
@@ -115,10 +108,7 @@ def _create_memory(client, agent_id: str, **overrides) -> dict:
 
 def _delete_memory(client, memory_id: str, **overrides):
     """DELETE /memories/{id}?actor_type=&actor_id= (no body in this client)."""
-    params = {
-        "actor_type": "agent",
-        "actor_id": f"actor-{uuid.uuid4()}",
-    }
+    params = {}
     params.update(overrides)
     return client.delete(f"/memories/{memory_id}", params=params)
 
@@ -158,8 +148,6 @@ def test_post_memory_success(client):
                 "type": "semantic",
                 "content": "M.I.N.D. = Multimodal Intelligence & Neural Diagnostics",
                 "classification": "internal",
-                "actor_type": "agent",
-                "actor_id": actor,
             },
         )
         assert resp.status_code == 201, resp.text
@@ -185,8 +173,6 @@ def test_post_memory_default_classification_internal(client):
                 "agent_id": agent_id,
                 "type": "episodic",
                 "content": "default classification should be internal",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 201, resp.text
@@ -207,8 +193,6 @@ def test_post_memory_with_metadata_and_embedding(client):
                 "content": "vector memory",
                 "metadata": {"source": "sensor-7", "confidence": 0.91},
                 "embedding": [0.1, 0.2, 0.3],
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 201, resp.text
@@ -229,8 +213,6 @@ def test_post_memory_actor_type_human(client):
                 "agent_id": agent_id,
                 "type": "semantic",
                 "content": "logged by a human actor",
-                "actor_type": "human",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 201, resp.text
@@ -247,8 +229,10 @@ def test_post_memory_missing_required_field(client):
     assert resp.status_code == 422
 
 
-def test_post_memory_requires_actor_id(client):
-    # actor_id is required by the transport model (audit_logs.actor_id NOT NULL)
+def test_post_memory_without_body_actor_id_succeeds(client):
+    # Phase 5.8: the audit actor is taken from the trusted SecurityContext,
+    # not the request body, so a memory can be created without supplying
+    # actor_id in the body.
     resp = client.post(
         "/memories",
         json={
@@ -257,7 +241,8 @@ def test_post_memory_requires_actor_id(client):
             "content": "x",
         },
     )
-    assert resp.status_code == 422
+    assert resp.status_code == 201, resp.text
+    _cleanup_memory(resp.json()["id"])
 
 
 def test_post_memory_rejects_secret(client):
@@ -271,8 +256,6 @@ def test_post_memory_rejects_secret(client):
                 "type": "semantic",
                 "content": "top secret",
                 "classification": "secret",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 403, resp.text
@@ -290,8 +273,6 @@ def test_post_memory_invalid_type(client):
                 "agent_id": agent_id,
                 "type": "procedural",
                 "content": "x",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 422
@@ -308,8 +289,6 @@ def test_post_memory_empty_content(client):
                 "agent_id": agent_id,
                 "type": "semantic",
                 "content": "",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 422
@@ -325,8 +304,6 @@ def test_post_memory_invalid_agent_id(client):
             "agent_id": "not-a-uuid",
             "type": "semantic",
             "content": "x",
-            "actor_type": "agent",
-            "actor_id": f"actor-{uuid.uuid4()}",
         },
     )
     assert resp.status_code == 400, resp.text
@@ -344,8 +321,6 @@ def test_post_memory_actor_id_is_free_text(client):
                 "agent_id": agent_id,
                 "type": "semantic",
                 "content": "x",
-                "actor_type": "agent",
-                "actor_id": "not-a-uuid-but-accepted",
             },
         )
         assert resp.status_code == 201, resp.text
@@ -456,7 +431,7 @@ def test_patch_memory_success(client):
         mid = created["id"]
         resp = client.patch(
             f"/memories/{mid}",
-            json={"content": "updated", "actor_type": "agent", "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"content": "updated"},
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["content"] == "updated"
@@ -474,8 +449,6 @@ def test_patch_memory_preserves_unchanged_fields(client):
             f"/memories/{mid}",
             json={
                 "content": "new content",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 200, resp.text
@@ -490,7 +463,7 @@ def test_patch_memory_preserves_unchanged_fields(client):
 def test_patch_memory_not_found(client):
     resp = client.patch(
         f"/memories/{uuid.uuid4()}",
-        json={"content": "x", "actor_type": "agent", "actor_id": f"actor-{uuid.uuid4()}"},
+        json={"content": "x"},
     )
     assert resp.status_code == 404, resp.text
     assert resp.json()["error"] == "not_found"
@@ -505,8 +478,6 @@ def test_patch_memory_rejects_secret(client):
             f"/memories/{mid}",
             json={
                 "classification": "secret",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 403, resp.text
@@ -519,18 +490,19 @@ def test_patch_memory_rejects_secret(client):
 def test_patch_memory_invalid_id(client):
     resp = client.patch(
         "/memories/not-a-uuid",
-        json={"content": "x", "actor_type": "agent", "actor_id": f"actor-{uuid.uuid4()}"},
+        json={"content": "x"},
     )
     assert resp.status_code == 400, resp.text
     assert resp.json()["error"] == "validation_error"
 
 
-def test_patch_memory_requires_actor_id(client):
+def test_patch_memory_without_body_actor_id_succeeds(client):
+    # Phase 5.8: audit actor comes from the trusted SecurityContext.
     agent_id = _make_agent()
     try:
         created = _create_memory(client, agent_id, content="x")
         resp = client.patch(f"/memories/{created['id']}", json={"content": "y"})
-        assert resp.status_code == 422
+        assert resp.status_code == 200, resp.text
         _cleanup_memory(created["id"])
     finally:
         _delete_agent(agent_id)
@@ -562,13 +534,14 @@ def test_delete_memory_invalid_id(client):
     assert resp.json()["error"] == "validation_error"
 
 
-def test_delete_memory_requires_actor_id(client):
+def test_delete_memory_without_body_actor_id_succeeds(client):
+    # Phase 5.8: audit actor comes from the trusted SecurityContext; DELETE
+    # carries no body, so no actor_id is supplied by the client.
     agent_id = _make_agent()
     try:
         created = _create_memory(client, agent_id, content="x")
-        # Missing actor_id query param -> transport validation -> 422.
         resp = client.delete(f"/memories/{created['id']}")
-        assert resp.status_code == 422
+        assert resp.status_code == 200, resp.text
         _cleanup_memory(created["id"])
     finally:
         _delete_agent(agent_id)
@@ -597,8 +570,6 @@ def test_transaction_commit_on_success(client):
                 "agent_id": agent_id,
                 "type": "semantic",
                 "content": "committed memory",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 201
@@ -625,9 +596,7 @@ def test_transaction_rollback_on_domain_error(client):
         json={
             "agent_id": missing,
             "type": "semantic",
-            "content": content,
-            "actor_type": "agent",
-            "actor_id": f"actor-{uuid.uuid4()}",
+                "content": content,
         },
     )
     assert resp.status_code == 404
@@ -651,8 +620,6 @@ def test_audit_log_written_on_create(client):
                 "agent_id": agent_id,
                 "type": "semantic",
                 "content": "audited create",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         after = _count_audit("memory.create")
@@ -668,7 +635,7 @@ def test_audit_log_written_on_update(client):
         before = _count_audit("memory.update")
         client.patch(
             f"/memories/{created['id']}",
-            json={"content": "changed", "actor_type": "agent", "actor_id": f"actor-{uuid.uuid4()}"},
+            json={"content": "changed"},
         )
         after = _count_audit("memory.update")
         assert after == before + 1
@@ -726,8 +693,6 @@ def test_router_invokes_memory_service(monkeypatch, client):
                 "agent_id": agent_id,
                 "type": "semantic",
                 "content": "spy memory",
-                "actor_type": "agent",
-                "actor_id": f"actor-{uuid.uuid4()}",
             },
         )
         assert resp.status_code == 201

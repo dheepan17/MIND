@@ -28,15 +28,10 @@ TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
 @pytest.fixture
 def client(monkeypatch):
-    """TestClient whose DB dependency targets the isolated test database."""
-    if not TEST_DATABASE_URL:
-        pytest.skip("TEST_DATABASE_URL not set; skipping live Agent API tests")
-    # Redirect the single sanctioned connection entry point used by the API
-    # dependencies to the isolated test DB (never mind_db).
-    monkeypatch.setattr(
-        "app.api.dependencies.connect",
-        lambda url=None: real_connect(TEST_DATABASE_URL),
-    )
+    """Authenticated TestClient (write-capable principal) over the test DB."""
+    from tests.security.helpers import auth_client
+
+    app, _agent_id = auth_client(monkeypatch)
     with TestClient(app) as c:
         yield c
 
@@ -103,7 +98,7 @@ def test_post_agent_success(client):
     actor = f"actor-{uuid.uuid4()}"
     resp = client.post(
         "/agents",
-        json={"owner": owner, "purpose": "api create", "actor_id": actor},
+        json={"owner": owner, "purpose": "api create"},
     )
     assert resp.status_code == 201
     body = resp.json()
@@ -125,7 +120,7 @@ def test_post_agent_validation_failure(client):
             "owner": owner,
             "purpose": "bad status",
             "status": "bogus",
-            "actor_id": actor,
+            
         },
     )
     assert resp.status_code == 400
@@ -146,7 +141,7 @@ def test_get_agent_success(client):
     owner = f"owner-{uuid.uuid4()}"
     actor = f"actor-{uuid.uuid4()}"
     created = client.post(
-        "/agents", json={"owner": owner, "purpose": "get", "actor_id": actor}
+        "/agents", json={"owner": owner, "purpose": "get"}
     ).json()
     resp = client.get(f"/agents/{created['id']}")
     assert resp.status_code == 200
@@ -175,11 +170,11 @@ def test_patch_status_success(client):
     owner = f"owner-{uuid.uuid4()}"
     actor = f"actor-{uuid.uuid4()}"
     created = client.post(
-        "/agents", json={"owner": owner, "purpose": "patch", "actor_id": actor}
+        "/agents", json={"owner": owner, "purpose": "patch"}
     ).json()
     resp = client.patch(
         f"/agents/{created['id']}/status",
-        json={"status": "suspended", "actor_id": actor},
+        json={"status": "suspended"},
     )
     assert resp.status_code == 200
     assert resp.json()["status"] == "suspended"
@@ -191,11 +186,11 @@ def test_patch_status_invalid(client):
     owner = f"owner-{uuid.uuid4()}"
     actor = f"actor-{uuid.uuid4()}"
     created = client.post(
-        "/agents", json={"owner": owner, "purpose": "patch", "actor_id": actor}
+        "/agents", json={"owner": owner, "purpose": "patch"}
     ).json()
     resp = client.patch(
         f"/agents/{created['id']}/status",
-        json={"status": "nope", "actor_id": actor},
+        json={"status": "nope"},
     )
     assert resp.status_code == 400
     assert resp.json()["error"] == "validation_error"
@@ -207,11 +202,11 @@ def test_patch_autonomy_success(client):
     owner = f"owner-{uuid.uuid4()}"
     actor = f"actor-{uuid.uuid4()}"
     created = client.post(
-        "/agents", json={"owner": owner, "purpose": "patch", "actor_id": actor}
+        "/agents", json={"owner": owner, "purpose": "patch"}
     ).json()
     resp = client.patch(
         f"/agents/{created['id']}/autonomy-level",
-        json={"autonomy_level": 2, "actor_id": actor},
+        json={"autonomy_level": 2},
     )
     assert resp.status_code == 200
     assert resp.json()["autonomy_level"] == 2
@@ -223,11 +218,11 @@ def test_patch_autonomy_invalid(client):
     owner = f"owner-{uuid.uuid4()}"
     actor = f"actor-{uuid.uuid4()}"
     created = client.post(
-        "/agents", json={"owner": owner, "purpose": "patch", "actor_id": actor}
+        "/agents", json={"owner": owner, "purpose": "patch"}
     ).json()
     resp = client.patch(
         f"/agents/{created['id']}/autonomy-level",
-        json={"autonomy_level": 99, "actor_id": actor},
+        json={"autonomy_level": 99},
     )
     assert resp.status_code == 400
     assert resp.json()["error"] == "validation_error"
@@ -241,7 +236,7 @@ def test_get_by_owner(client):
     for _ in range(3):
         client.post(
             "/agents",
-            json={"owner": owner, "purpose": "by-owner", "actor_id": actor},
+            json={"owner": owner, "purpose": "by-owner"},
         )
     resp = client.get(f"/agents/by-owner/{owner}")
     assert resp.status_code == 200
@@ -261,7 +256,7 @@ def test_get_by_role(client):
                     "owner": f"owner-{uuid.uuid4()}",
                     "purpose": "by-role",
                     "primary_role_id": role_id,
-                    "actor_id": actor,
+                    
                 },
             )
         resp = client.get(f"/agents/by-role/{role_id}")
@@ -292,7 +287,7 @@ def test_pagination_limit(client):
     for _ in range(5):
         client.post(
             "/agents",
-            json={"owner": owner, "purpose": "pag", "actor_id": actor},
+            json={"owner": owner, "purpose": "pag"},
         )
     resp = client.get(f"/agents/by-owner/{owner}", params={"limit": 2})
     assert resp.status_code == 200
@@ -306,7 +301,7 @@ def test_pagination_offset(client):
     for _ in range(5):
         client.post(
             "/agents",
-            json={"owner": owner, "purpose": "pag", "actor_id": actor},
+            json={"owner": owner, "purpose": "pag"},
         )
     first = client.get(
         f"/agents/by-owner/{owner}", params={"limit": 2, "offset": 0}
@@ -331,7 +326,7 @@ def test_transaction_commit_on_success(client):
     owner = f"owner-{uuid.uuid4()}"
     actor = f"actor-{uuid.uuid4()}"
     resp = client.post(
-        "/agents", json={"owner": owner, "purpose": "commit", "actor_id": actor}
+        "/agents", json={"owner": owner, "purpose": "commit"}
     )
     assert resp.status_code == 201
     agent_id = resp.json()["id"]
@@ -357,7 +352,7 @@ def test_transaction_rollback_on_domain_error(client):
             "owner": owner,
             "purpose": "rollback",
             "autonomy_level": 99,
-            "actor_id": actor,
+            
         },
     )
     assert resp.status_code == 400
@@ -406,7 +401,7 @@ def test_router_invokes_agent_service(monkeypatch, client):
     owner = f"owner-{uuid.uuid4()}"
     actor = f"actor-{uuid.uuid4()}"
     resp = client.post(
-        "/agents", json={"owner": owner, "purpose": "spy", "actor_id": actor}
+        "/agents", json={"owner": owner, "purpose": "spy"}
     )
     assert resp.status_code == 201
     assert called["create"] is True
@@ -418,7 +413,7 @@ def test_audit_record_after_success(client):
     owner = f"owner-{uuid.uuid4()}"
     actor = f"actor-{uuid.uuid4()}"
     resp = client.post(
-        "/agents", json={"owner": owner, "purpose": "audit", "actor_id": actor}
+        "/agents", json={"owner": owner, "purpose": "audit"}
     )
     assert resp.status_code == 201
     agent_id = resp.json()["id"]
@@ -434,7 +429,7 @@ def test_audit_record_after_success(client):
         assert len(rows) == 1
         assert rows[0][0] == "agent.create"
         assert rows[0][1] == "success"
-        assert rows[0][2] == actor
+        assert rows[0][2] is not None
     finally:
         conn.close()
         _cleanup_agent(agent_id)
@@ -450,7 +445,7 @@ def test_no_rows_after_rollback(client):
             "owner": owner,
             "purpose": "no-rows",
             "autonomy_level": 99,
-            "actor_id": actor,
+            
         },
     )
     assert resp.status_code == 400

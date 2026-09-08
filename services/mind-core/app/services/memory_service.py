@@ -27,15 +27,16 @@ consistent with :class:`AgentService`.
 
 Authorization boundary
 ----------------------
-The current capability catalog (``read | write | shell | network |
-data:pii | admin:roles``) defines **no** memory capability (e.g. no
-``memory:write``). Following the same pattern as ``AgentService`` (4.4),
-``TaskService`` (4.5), ``JobService`` (4.6) and ``EventService`` (4.7),
-this service does NOT gate memory operations on a capability. When such
-capabilities are introduced, callers can compose
-``PermissionService.require_capability(...)`` inside their transaction, or
-this service can be extended to require them — no schema change is needed.
-We deliberately do not invent a ``memory:*`` capability here.
+Per the approved Phase 5.7A security policy, every memory *mutation* is
+gated on the generic ``write`` capability (catalog: ``read | write | shell |
+network | data:pii | admin:roles``). No resource-scoped capability (e.g.
+``memory:write``) is invented. Authorization occurs **inside** the
+caller-owned transaction, **before** the mutation, via
+``PermissionService.require_write(...)`` using the *trusted*
+``SecurityContext.actor_id`` supplied by the router. A missing ``write``
+capability raises :class:`AuthorizationError` (HTTP 403); the denial is
+recorded in ``audit_logs`` with ``outcome='denied'`` and
+``capability_used='write'``.
 
 Audit actor
 -----------
@@ -52,7 +53,8 @@ from app.repositories.agents import AgentRepository
 from app.repositories.memories import _UNSET, MemoryRepository
 from app.services.audit_service import AuditService
 from app.services.base import BaseService
-from app.services.errors import NotFoundError, ValidationError
+from app.services.errors import AuthorizationError, NotFoundError, ValidationError
+from app.services.permission_service import PermissionService
 
 _MAX_LIMIT = 100
 _VALID_ACTOR_TYPES = ("agent", "human", "role")
@@ -92,6 +94,38 @@ class MemoryService(BaseService):
         # AuditService shares this service's connection and therefore the
         # caller's transaction. No connection is created here.
         self._audit = AuditService(conn)
+        # PermissionService shares the same connection/transaction. It owns the
+        # generic ``write`` capability check (Phase 5.8).
+        self._perms = PermissionService(conn)
+
+    # ── authorization helpers (Phase 5.8) ───────────────────
+    def _require_write(self, actor_id: str) -> None:
+        """Gate a mutation on the generic ``write`` capability.
+
+        ``actor_id`` is the trusted ``SecurityContext.actor_id`` supplied by the
+        router — never a client-supplied body/query field. Raises
+        :class:`AuthorizationError` (HTTP 403) when the capability is absent.
+        """
+        self._perms.require_write(actor_id)
+
+    def _audit_denied(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        action: str,
+        target_id: str | None,
+    ) -> None:
+        """Record a denied memory mutation (missing/insufficient capability)."""
+        self._audit.record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action=action,
+            outcome="denied",
+            target_type="memory",
+            target_id=target_id,
+            capability_used="write",
+        )
 
     # ── helpers ────────────────────────────────────────────
     def _require_memory(self, memory_id: str) -> dict:
@@ -176,6 +210,18 @@ class MemoryService(BaseService):
 
         # Existence check (do not rely on raw FK errors for user input).
         self._require_agent(agent_id)
+
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="memory.create",
+                target_id=None,
+            )
+            raise
 
         memory = self.repository(MemoryRepository).create(
             agent_id=agent_id,
@@ -270,6 +316,18 @@ class MemoryService(BaseService):
             if v is not None
         ]
 
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="memory.update",
+                target_id=memory_id,
+            )
+            raise
+
         updated = self.repository(MemoryRepository).update(
             memory_id,
             content=content_arg,
@@ -304,6 +362,17 @@ class MemoryService(BaseService):
         _require_uuid(memory_id, "memory_id")
         self._validate_actor(actor_type, actor_id)
         self._require_memory(memory_id)
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="memory.soft_delete",
+                target_id=memory_id,
+            )
+            raise
         updated = self.repository(MemoryRepository).soft_delete(memory_id)
         self._audit.record(
             actor_type=actor_type,

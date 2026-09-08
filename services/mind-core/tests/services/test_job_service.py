@@ -89,6 +89,21 @@ def _make_job(service, agents, tasks=None, tools=None, **overrides) -> dict:
     return service.create(**payload)
 
 
+@pytest.fixture
+def perms(db):
+    from app.repositories.permissions import PermissionRepository
+
+    return PermissionRepository(db)
+
+
+def _make_role_cap(perms, role_name, cap_key):
+    """Create a role, a capability, and assign the cap to the role."""
+    role = perms.create_role(role_name)
+    cap = perms.create_capability(cap_key)
+    perms.assign_capability_to_role(role["id"], cap["id"])
+    return role, cap
+
+
 # ── 1. create success ───────────────────────────────────
 def test_create_job(service, agents):
     agent = _make_agent(agents)
@@ -435,11 +450,39 @@ def test_repository_is_used(monkeypatch, service, agents):
 
 
 # ── 32. no job-lifecycle capability policy enforced ─────
-def test_no_job_capability_policy_enforced(service, agents):
-    # The current capability catalog defines no job capability, so job
-    # operations are unconditionally callable at the service layer. This
-    # documents the boundary rather than inventing policy.
-    job = _make_job(service, agents)
+def test_write_capability_policy_enforced(service, perms, agents):
+    # Phase 5.8 authorization boundary: job mutations are gated on the generic
+    # ``write`` capability (no resource-scoped capability invented). An actor
+    # WITHOUT ``write`` is denied; WITH ``write`` it succeeds.
+    from app.services import AuthorizationError
+
+    # Writer agent inherits ``write`` through a role.
+    role, _cap = _make_role_cap(perms, "writer", "write")
+    writer = agents.create(owner=_uid("owner"), purpose="p", primary_role_id=role["id"])
+    # Actor with no capabilities.
+    no_write = _make_agent(agents)
+
+    # Actor lacking ``write`` is denied (no job is created).
+    with pytest.raises(AuthorizationError):
+        service.create(actor_id=no_write["id"])
+
+    # An existing job cannot be mutated by an actor lacking ``write``.
+    job = _make_job(service, agents, actor_id=writer["id"])
+    with pytest.raises(AuthorizationError):
+        service.mark_started(job["id"], actor_id=no_write["id"])
+
+    # Actor WITH ``write`` succeeds.
+    job = _make_job(service, agents, actor_id=writer["id"])
     assert job["id"] is not None
-    updated = service.mark_started(job["id"], actor_id=ACTOR)
+    updated = service.mark_started(job["id"], actor_id=writer["id"])
     assert updated["status"] == "running"
+
+    # A denial audit row exists for the unauthorized create attempt.
+    audit = AuditService(service._conn)
+    denied = [
+        r
+        for r in audit.list_by_actor("agent", no_write["id"])
+        if r["action"] == "job.create" and r["outcome"] == "denied"
+    ]
+    assert denied, "expected a denied audit record for the unauthorized create"
+    assert denied[0]["capability_used"] == "write"

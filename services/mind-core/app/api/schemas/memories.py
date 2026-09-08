@@ -27,12 +27,12 @@ class CreateMemoryRequest(BaseModel):
     """Body for ``POST /memories``.
 
     Only fields actually accepted by ``MemoryService.create`` are present.
-    ``agent_id`` and ``actor_id`` are required strings (the service validates
-    UUID shape and agent existence). ``type`` and ``classification`` use
-    ``Literal`` enums so invalid values are rejected at transport time.
-    ``content`` must be non-empty (``min_length=1``). ``actor_type`` defaults
-    to ``"agent"`` to match the service default; ``actor_id`` is required
-    because ``audit_logs.actor_id`` is NOT NULL.
+    ``agent_id`` is a required string (the service validates UUID shape and
+    agent existence); it is the memory owner, NOT the audit actor. ``type`` and
+    ``classification`` use ``Literal`` enums so invalid values are rejected at
+    transport time. ``content`` must be non-empty (``min_length=1``). Caller
+    identity (``actor_id``/``actor_type``) is supplied by the trusted
+    SecurityContext, never the request body (Phase 5.8).
     """
 
     agent_id: str
@@ -41,8 +41,6 @@ class CreateMemoryRequest(BaseModel):
     classification: Literal["public", "internal", "secret"] = "internal"
     embedding: list[float] | None = None
     metadata: dict | None = None
-    actor_type: Literal["agent", "human", "role"] = "agent"
-    actor_id: str
 
 
 class UpdateMemoryRequest(BaseModel):
@@ -50,29 +48,23 @@ class UpdateMemoryRequest(BaseModel):
 
     All mutable fields are optional; the service treats ``None`` as
     "leave unchanged". ``content`` (when supplied) must be non-empty.
-    ``classification`` (when supplied) uses the ``Literal`` enum. ``actor_id``
-    is required because ``audit_logs.actor_id`` is NOT NULL and the service has
-    no default for updates.
+    ``classification`` (when supplied) uses the ``Literal`` enum. Caller
+    identity (``actor_id``/``actor_type``) is supplied by the trusted
+    SecurityContext, never the request body (Phase 5.8).
     """
 
     content: str | None = Field(default=None, min_length=1)
     classification: Literal["public", "internal", "secret"] | None = None
     embedding: list[float] | None = None
     metadata: dict | None = None
-    actor_type: Literal["agent", "human", "role"] = "agent"
-    actor_id: str
 
 
 class DeleteMemoryRequest(BaseModel):
-    """Body for ``DELETE /memories/{id}`` (soft delete).
+    """Unused schema for ``DELETE /memories/{id}`` (soft delete).
 
-    ``MemoryService.soft_delete`` requires an ``actor_id`` (the audit log's
-    NOT NULL principal) and accepts an ``actor_type`` (default ``"agent"``).
-    No other fields are relevant to a soft delete.
+    The DELETE route no longer accepts a body; the audit identity is taken
+    from the trusted SecurityContext. Retained for reference/tooling only.
     """
-
-    actor_type: Literal["agent", "human", "role"] = "agent"
-    actor_id: str
 
 
 class MemoryResponse(BaseModel):

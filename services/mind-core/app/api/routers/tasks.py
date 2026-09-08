@@ -24,6 +24,7 @@ from app.api.schemas.tasks import (
     TaskResponse,
     UpdateTaskStatusRequest,
 )
+from app.api.security import SecurityContext, get_security_context
 from app.services.task_service import TaskService
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -36,10 +37,28 @@ Conn = Annotated[object, Depends(get_conn)]
 
 
 @router.post("", response_model=TaskResponse, status_code=201)
-def create_task(body: CreateTaskRequest, conn: Txn) -> dict:
-    """Create a task. Delegates all validation/audit to TaskService."""
+def create_task(
+    body: CreateTaskRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
+    """Create a task. Delegates all validation/audit to TaskService.
+
+    Caller identity comes from the trusted SecurityContext (Phase 5.8).
+    """
     service = TaskService(conn)
-    return service.create(**body.model_dump())
+    return service.create(
+        title=body.title,
+        agent_id=body.agent_id,
+        status=body.status,
+        priority=body.priority,
+        parent_task_id=body.parent_task_id,
+        description=body.description,
+        input_payload=body.input_payload,
+        metadata=body.metadata,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
+    )
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
@@ -50,29 +69,35 @@ def get_task(task_id: str, conn: Conn) -> dict:
 
 @router.patch("/{task_id}/status", response_model=TaskResponse)
 def update_task_status(
-    task_id: str, body: UpdateTaskStatusRequest, conn: Txn
+    task_id: str,
+    body: UpdateTaskStatusRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
 ) -> dict:
     """Update a task's status. Domain validation lives in TaskService."""
     service = TaskService(conn)
     return service.update_status(
         task_id,
         status=body.status,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 
 @router.patch("/{task_id}/assign-agent", response_model=TaskResponse)
 def assign_task_agent(
-    task_id: str, body: AssignTaskAgentRequest, conn: Txn
+    task_id: str,
+    body: AssignTaskAgentRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
 ) -> dict:
     """Assign (or unassign) the agent owning a task. Service owns validation."""
     service = TaskService(conn)
     return service.assign_agent(
         task_id,
         agent_id=body.agent_id,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 

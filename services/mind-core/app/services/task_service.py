@@ -35,7 +35,8 @@ from app.repositories.agents import AgentRepository
 from app.repositories.tasks import TaskRepository
 from app.services.audit_service import AuditService
 from app.services.base import BaseService
-from app.services.errors import NotFoundError, ValidationError
+from app.services.errors import AuthorizationError, NotFoundError, ValidationError
+from app.services.permission_service import PermissionService
 
 _VALID_STATUSES = (
     "pending",
@@ -59,6 +60,42 @@ def _is_uuid(value: str) -> bool:
 
 class TaskService(BaseService):
     """Business boundary for task lifecycle operations."""
+
+    def __init__(self, conn) -> None:
+        super().__init__(conn)
+        # PermissionService shares this service's connection and therefore the
+        # caller's transaction. It owns the generic ``write`` capability check
+        # (Phase 5.8).
+        self._perms = PermissionService(conn)
+
+    # ── authorization helpers (Phase 5.8) ───────────────────
+    def _require_write(self, actor_id: str) -> None:
+        """Gate a mutation on the generic ``write`` capability.
+
+        ``actor_id`` is the trusted ``SecurityContext.actor_id`` supplied by the
+        router — never a client-supplied body/query field. Raises
+        :class:`AuthorizationError` (HTTP 403) when the capability is absent.
+        """
+        self._perms.require_write(actor_id)
+
+    def _audit_denied(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        action: str,
+        target_id: str | None,
+    ) -> None:
+        """Record a denied task mutation (missing/insufficient capability)."""
+        AuditService(self._conn).record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action=action,
+            outcome="denied",
+            target_type="task",
+            target_id=target_id,
+            capability_used="write",
+        )
 
     # ── helpers ───────────────────────────────────────────
     def _require_task(self, task_id: str) -> dict:
@@ -146,6 +183,18 @@ class TaskService(BaseService):
             # need to confirm the referenced parent exists.
             self._require_task(parent_task_id)
 
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="task.create",
+                target_id=None,
+            )
+            raise
+
         task = self.repository(TaskRepository).create(
             agent_id=agent_id,
             title=title,
@@ -191,6 +240,17 @@ class TaskService(BaseService):
                 f"actor_type must be one of {_VALID_ACTOR_TYPES}."
             )
         self._require_task(task_id)
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="task.update_status",
+                target_id=task_id,
+            )
+            raise
         self.repository(TaskRepository).update_status(task_id, status)
         # completed_at is owned by the repository (set on completion).
         self._audit(
@@ -222,8 +282,19 @@ class TaskService(BaseService):
         self._require_task(task_id)
         if agent_id is not None:
             self._require_agent(agent_id)
-        # No task:assign capability exists yet; follow AgentService's
-        # boundary and do not invent one.
+        # Authorization occurs inside the transaction, before the mutation.
+        try:
+            self._require_write(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action="task.assign_agent",
+                target_id=task_id,
+            )
+            raise
+        # No resource-scoped capability is invented; the generic ``write``
+        # capability (checked above) gates this mutation.
         self.repository(TaskRepository).assign_agent(task_id, agent_id)
         self._audit(
             actor_type=actor_type,

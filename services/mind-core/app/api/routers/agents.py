@@ -37,10 +37,26 @@ Conn = Annotated[object, Depends(get_conn)]
 
 
 @router.post("", response_model=AgentResponse, status_code=201)
-def create_agent(body: CreateAgentRequest, conn: Txn) -> dict:
-    """Create an agent. Delegates all validation/audit to AgentService."""
+def create_agent(
+    body: CreateAgentRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
+    """Create an agent. Delegates all validation/audit to AgentService.
+
+    The trusted SecurityContext supplies the actor identity; the request body
+    no longer carries caller identity (Phase 5.8).
+    """
     service = AgentService(conn)
-    return service.create(**body.model_dump())
+    return service.create(
+        owner=body.owner,
+        purpose=body.purpose,
+        autonomy_level=body.autonomy_level,
+        primary_role_id=body.primary_role_id,
+        status=body.status,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
+    )
 
 
 @router.get("/{agent_id}", response_model=AgentResponse)
@@ -51,15 +67,18 @@ def get_agent(agent_id: str, conn: Conn) -> dict:
 
 @router.patch("/{agent_id}/status", response_model=AgentResponse)
 def update_agent_status(
-    agent_id: str, body: UpdateStatusRequest, conn: Txn
+    agent_id: str,
+    body: UpdateStatusRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
 ) -> dict:
     """Update an agent's status. Domain validation lives in AgentService."""
     service = AgentService(conn)
     return service.update_status(
         agent_id,
         status=body.status,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 
@@ -70,13 +89,14 @@ def update_agent_status_secure(
     ctx: Annotated[SecurityContext, Depends(get_security_context)],
     conn: Txn,
 ) -> dict:
-    """Opt-in identity-boundary demo (Phase 5.7A).
+    """Trusted-identity status update (Phase 5.7A/5.8).
 
-    Uses the trusted :class:`SecurityContext` for audit attribution instead of
-    the request body's self-asserted ``actor_id``/``actor_type``. The original
-    ``PATCH /agents/{agent_id}/status`` route is preserved unchanged for
-    backward compatibility. Only this opt-in route requires authentication;
-    missing/invalid credentials raise ``AuthenticationError`` -> HTTP 401.
+    Delegates to the same gated :meth:`AgentService.update_status` as the
+    standard ``PATCH /agents/{agent_id}/status`` route, but is explicit about
+    using the trusted :class:`SecurityContext` for audit attribution (never the
+    HTTP body). Requires authentication; missing/invalid credentials raise
+    ``AuthenticationError`` -> HTTP 401. The mutation is authorized inside the
+    service transaction via the generic ``write`` capability.
     """
     service = AgentService(conn)
     return service.update_status(
@@ -90,15 +110,18 @@ def update_agent_status_secure(
 
 @router.patch("/{agent_id}/autonomy-level", response_model=AgentResponse)
 def update_agent_autonomy(
-    agent_id: str, body: UpdateAutonomyRequest, conn: Txn
+    agent_id: str,
+    body: UpdateAutonomyRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
 ) -> dict:
     """Update an agent's stored autonomy level (interpretation is elsewhere)."""
     service = AgentService(conn)
     return service.update_autonomy_level(
         agent_id,
         autonomy_level=body.autonomy_level,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 

@@ -26,6 +26,7 @@ from app.api.schemas.jobs import (
     RetryJobRequest,
     StartJobRequest,
 )
+from app.api.security import SecurityContext, get_security_context
 from app.services.job_service import JobService
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
@@ -38,10 +39,25 @@ Conn = Annotated[object, Depends(get_conn)]
 
 
 @router.post("", response_model=JobResponse, status_code=201)
-def create_job(body: CreateJobRequest, conn: Txn) -> dict:
-    """Create a job. Delegates all validation/audit to JobService."""
+def create_job(
+    body: CreateJobRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
+    """Create a job. Delegates all validation/audit to JobService.
+
+    Caller identity comes from the trusted SecurityContext (Phase 5.8).
+    """
     service = JobService(conn)
-    return service.create(**body.model_dump())
+    return service.create(
+        task_id=body.task_id,
+        agent_id=body.agent_id,
+        tool_id=body.tool_id,
+        status=body.status,
+        scheduled_at=body.scheduled_at,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
+    )
 
 
 @router.get("/{job_id}", response_model=JobResponse)
@@ -51,48 +67,68 @@ def get_job(job_id: str, conn: Conn) -> dict:
 
 
 @router.post("/{job_id}/start", response_model=JobResponse)
-def start_job(job_id: str, body: StartJobRequest, conn: Txn) -> dict:
+def start_job(
+    job_id: str,
+    body: StartJobRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
     """Mark a job running. Domain validation lives in JobService."""
     service = JobService(conn)
     return service.start(
         job_id,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 
 @router.post("/{job_id}/finish", response_model=JobResponse)
-def finish_job(job_id: str, body: FinishJobRequest, conn: Txn) -> dict:
+def finish_job(
+    job_id: str,
+    body: FinishJobRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
     """Mark a job succeeded. Domain validation lives in JobService."""
     service = JobService(conn)
     return service.finish(
         job_id,
         result=body.result,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 
 @router.post("/{job_id}/fail", response_model=JobResponse)
-def fail_job(job_id: str, body: FailJobRequest, conn: Txn) -> dict:
+def fail_job(
+    job_id: str,
+    body: FailJobRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
     """Mark a job failed. Domain validation lives in JobService."""
     service = JobService(conn)
     return service.fail(
         job_id,
         error=body.error,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 
 @router.post("/{job_id}/retry", response_model=JobResponse)
-def retry_job(job_id: str, body: RetryJobRequest, conn: Txn) -> dict:
+def retry_job(
+    job_id: str,
+    body: RetryJobRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
     """Re-queue a failed job. Domain validation lives in JobService."""
     service = JobService(conn)
     return service.retry(
         job_id,
-        actor_type=body.actor_type,
-        actor_id=body.actor_id,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
     )
 
 

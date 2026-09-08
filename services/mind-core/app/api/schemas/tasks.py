@@ -17,15 +17,13 @@ class CreateTaskRequest(BaseModel):
     """Body for ``POST /tasks``.
 
     Only fields actually accepted by ``TaskService.create`` are present.
-    ``actor_type`` defaults to ``"agent"`` to match the service default;
-    ``actor_id`` is required because ``audit_logs.actor_id`` is NOT NULL.
     ``agent_id`` is optional: when omitted the task is created unassigned
-    (the service only enforces existence when a value is supplied).
+    (the service only enforces existence when a value is supplied). Caller
+    identity (``actor_id``/``actor_type``) is supplied by the trusted
+    SecurityContext, never the request body (Phase 5.8).
     """
 
     title: str
-    actor_id: str
-    actor_type: str = "agent"
     agent_id: str | None = None
     status: str = "pending"
     priority: int = 5
@@ -36,22 +34,22 @@ class CreateTaskRequest(BaseModel):
 
 
 class UpdateTaskStatusRequest(BaseModel):
-    """Body for ``PATCH /tasks/{id}/status``."""
+    """Body for ``PATCH /tasks/{id}/status``.
+
+    Caller identity is supplied by the trusted SecurityContext, not the body.
+    """
 
     status: str
-    actor_id: str
-    actor_type: str = "agent"
 
 
 class AssignTaskAgentRequest(BaseModel):
     """Body for ``PATCH /tasks/{id}/assign-agent``.
 
-    ``agent_id`` may be null to unassign the task.
+    ``agent_id`` may be null to unassign the task. Caller identity is supplied
+    by the trusted SecurityContext, not the body.
     """
 
     agent_id: str | None = None
-    actor_id: str
-    actor_type: str = "agent"
 
 
 class TaskResponse(BaseModel):
