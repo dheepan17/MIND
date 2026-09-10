@@ -135,3 +135,17 @@ class PermissionRepository(BaseRepository):
         with self._cur() as cur:
             cur.execute(sql, (agent_id, agent_id))
             return cur.fetchall()
+    def list_capabilities(self, limit: int = 100, offset: int = 0) -> list[dict]:
+        sql = (
+            "SELECT id, key, description FROM capabilities "
+            "ORDER BY key ASC LIMIT %s OFFSET %s"
+        )
+        with self._cur() as cur:
+            cur.execute(sql, (limit, offset))
+            return cur.fetchall()
+
+    def get_grant(self, grant_id: str) -> dict | None:
+        sql = 'SELECT * FROM permission_grants WHERE id = %s'
+        with self._cur() as cur:
+            cur.execute(sql, (grant_id,))
+            return cur.fetchone()

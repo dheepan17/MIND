@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from app.repositories.agents import AgentRepository
 from app.repositories.permissions import PermissionRepository
+from app.services.audit_service import AuditService
 from app.services.base import BaseService
 from app.services.errors import AuthorizationError, NotFoundError, ValidationError
 
@@ -32,6 +33,16 @@ from app.services.errors import AuthorizationError, NotFoundError, ValidationErr
 # generic capability; no resource-scoped capabilities (agent:create, task:create,
 # memory:create, …) are invented.
 WRITE_CAPABILITY = "write"
+
+# Administrative capability (Phase 5.8). Every grant/revoke/list/effective
+# operation on the permission data is gated on this single capability. No new
+# capability names are introduced; this key already exists in the catalog
+# (read | write | shell | network | data:pii | admin:roles).
+ADMIN_CAPABILITY = "admin:roles"
+
+# Pagination ceiling for Phase 5.8 administrative list endpoints. Kept
+# consistent with the rest of the API surface.
+_MAX_LIMIT = 100
 
 
 class PermissionService(BaseService):
@@ -48,6 +59,9 @@ class PermissionService(BaseService):
         # caller's transaction scope. No connection is created here.
         self._permissions = PermissionRepository(conn)
         self._agents = AgentRepository(conn)
+        # AuditService shares this service's connection and therefore the
+        # caller's transaction. No connection is created here.
+        self._audit = AuditService(conn)
 
     # ── existence helpers ───────────────────────────────────
     def _require_agent(self, agent_id: str) -> None:
@@ -171,3 +185,213 @@ class PermissionService(BaseService):
         # The repository performs the UPDATE; a missing grant_id simply
         # affects zero rows (idempotent, non-erroring).
         self._permissions.revoke(grant_id)
+
+    # -- 6. admin authorization gate (Phase 5.8) ------------------------
+    def require_admin(self, actor_id: str) -> None:
+        """Raise :class:`AuthorizationError` unless the agent holds `admin:roles`.
+
+        Intent-revealing wrapper over :meth:`require_capability` for the
+        administrative capability. The actor id is the trusted
+        `SecurityContext.actor_id` passed down by routers -- never a
+        client-supplied body/query field.
+        """
+        self.require_capability(actor_id, ADMIN_CAPABILITY)
+
+    # -- validation helpers (Phase 5.8) ------------------------------------
+    @staticmethod
+    def _validate_paging(limit: int, offset: int) -> None:
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValidationError("limit must be an int.")
+        if limit < 1 or limit > _MAX_LIMIT:
+            raise ValidationError(
+                f"limit must be an int between 1 and {_MAX_LIMIT}."
+            )
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValidationError("offset must be an int.")
+        if offset < 0:
+            raise ValidationError("offset must be an int >= 0.")
+
+    # -- 7. audit helpers (Phase 5.8) ------------------------------------
+    def _audit_denied(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        action: str,
+        target_type: str | None = None,
+        target_id: str | None = None,
+    ) -> None:
+        self._audit.record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action=action,
+            outcome='denied',
+            target_type=target_type,
+            target_id=target_id,
+            capability_used=ADMIN_CAPABILITY,
+        )
+
+    # -- 8. grant a direct capability (admin-gated, Phase 5.8) -----------
+    def grant_capability_admin(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        agent_id: str,
+        capability_id: str,
+        scope: str = '*',
+        expires_at=None,
+    ) -> dict:
+        if not actor_id:
+            raise ValidationError('actor_id is required.')
+        if not actor_type:
+            raise ValidationError('actor_type is required.')
+        if not agent_id:
+            raise ValidationError('agent_id is required.')
+        if not capability_id:
+            raise ValidationError('capability_id is required.')
+        if scope is None:
+            raise ValidationError('scope must not be None.')
+
+        try:
+            self.require_admin(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action='permission.grant',
+                target_type='agent',
+                target_id=agent_id,
+            )
+            raise
+
+        self._require_agent(agent_id)
+        if self._permissions.get_capability(capability_id) is None:
+            raise NotFoundError(
+                f'Capability {capability_id!r} does not exist.'
+            )
+
+        grant = self._permissions.grant(
+            agent_id=agent_id,
+            capability_id=capability_id,
+            scope=scope,
+            granted_by=actor_id,
+            expires_at=expires_at,
+        )
+        self._audit.record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action='permission.grant',
+            outcome='success',
+            target_type='permission_grant',
+            target_id=grant['id'],
+            capability_used=ADMIN_CAPABILITY,
+            context={
+                'agent_id': agent_id,
+                'capability_id': capability_id,
+                'scope': scope,
+            },
+        )
+        return grant
+
+    # -- 9. revoke a direct grant (admin-gated, Phase 5.8) ----------------
+    def revoke_capability_admin(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        grant_id: str,
+    ) -> dict:
+        if not actor_id:
+            raise ValidationError('actor_id is required.')
+        if not actor_type:
+            raise ValidationError('actor_type is required.')
+        if not grant_id:
+            raise ValidationError('grant_id is required.')
+
+        try:
+            self.require_admin(actor_id)
+        except AuthorizationError:
+            self._audit_denied(
+                actor_type=actor_type,
+                actor_id=actor_id,
+                action='permission.revoke',
+                target_type='permission_grant',
+                target_id=grant_id,
+            )
+            raise
+
+        existing = self._permissions.get_grant(grant_id)
+        if existing is None:
+            raise NotFoundError(f"Grant '{grant_id}' does not exist.")
+
+        self._permissions.revoke(grant_id)
+        self._audit.record(
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action='permission.revoke',
+            outcome='success',
+            target_type='permission_grant',
+            target_id=grant_id,
+            capability_used=ADMIN_CAPABILITY,
+            context={'agent_id': existing['agent_id']},
+        )
+        return self._permissions.get_grant(grant_id)
+
+    # -- 10. list grants for an agent (admin-gated, Phase 5.8) ------------
+    def list_grants_for_agent_admin(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        agent_id: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        if not actor_id:
+            raise ValidationError('actor_id is required.')
+        if not actor_type:
+            raise ValidationError('actor_type is required.')
+        if not agent_id:
+            raise ValidationError('agent_id is required.')
+        self._require_agent(agent_id)
+        self._validate_paging(limit, offset)
+        self.require_admin(actor_id)
+        return self._permissions.list_grants_for_agent(
+            agent_id, limit=limit, offset=offset
+        )
+
+    # -- 11. list capabilities (admin-gated, Phase 5.8) -------------------
+    def list_capabilities_admin(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict]:
+        if not actor_id:
+            raise ValidationError('actor_id is required.')
+        if not actor_type:
+            raise ValidationError('actor_type is required.')
+        self._validate_paging(limit, offset)
+        self.require_admin(actor_id)
+        return self._permissions.list_capabilities(limit=limit, offset=offset)
+
+    # -- 12. effective capabilities (admin-gated, Phase 5.8) --------------
+    def get_effective_capabilities_admin(
+        self,
+        *,
+        actor_type: str,
+        actor_id: str,
+        agent_id: str,
+    ) -> list[dict]:
+        if not actor_id:
+            raise ValidationError('actor_id is required.')
+        if not actor_type:
+            raise ValidationError('actor_type is required.')
+        if not agent_id:
+            raise ValidationError('agent_id is required.')
+        self._require_agent(agent_id)
+        self.require_admin(actor_id)
+        return self._permissions.list_effective_capabilities(agent_id)

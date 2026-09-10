@@ -20,6 +20,7 @@ from app.api.routers import agents as agents_router
 from app.api.routers import events as events_router
 from app.api.routers import jobs as jobs_router
 from app.api.routers import memories as memories_router
+from app.api.routers import permissions as permissions_router
 from app.api.routers import tasks as tasks_router
 
 
@@ -49,6 +50,10 @@ def create_app() -> FastAPI:
     # conventions. Secret-classification operations are blocked at the policy
     # boundary (no authentication layer exists yet).
     application.include_router(memories_router.router)
+    # Phase 5.8: the Permissions API is a thin transport adapter over
+    # PermissionService, following the same boundary and transaction-ownership
+    # conventions. Every endpoint is gated on the ``admin:roles`` capability.
+    application.include_router(permissions_router.router)
 
     @application.get("/")
     def root():
