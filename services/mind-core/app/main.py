@@ -22,7 +22,7 @@ from app.api.routers import jobs as jobs_router
 from app.api.routers import memories as memories_router
 from app.api.routers import permissions as permissions_router
 from app.api.routers import tasks as tasks_router
-
+from app.api.routers import tools as tools_router
 
 def create_app() -> FastAPI:
     """Build the mind-core FastAPI application."""
@@ -54,6 +54,10 @@ def create_app() -> FastAPI:
     # PermissionService, following the same boundary and transaction-ownership
     # conventions. Every endpoint is gated on the ``admin:roles`` capability.
     application.include_router(permissions_router.router)
+    # Phase 5.9: the Tool API is a thin transport adapter over ToolService,
+    # following the same boundary and transaction-ownership conventions.
+    # Mutations require the generic ``write`` capability.
+    application.include_router(tools_router.router)
 
     @application.get("/")
     def root():
