@@ -24,20 +24,21 @@ class CreateEventRequest(BaseModel):
     """Body for ``POST /events``.
 
     Only fields actually accepted by ``EventService.create`` are present.
-    ``type`` and ``payload`` are required (the service rejects an empty type
-    and a null payload). ``producer_agent_id`` / ``correlation_id`` are
-    optional UUID strings; the service validates their shape and, for a
-    supplied ``producer_agent_id``, that the agent exists. ``signature`` is an
-    optional verbatim value: any JSON type is accepted at the transport layer
-    and the service enforces that it is a string or None (stored verbatim, no
+    ``type`` and ``payload`` are required. ``correlation_id`` is an optional
+    UUID string; the service validates its shape. ``signature`` is an optional
+    verbatim value: any JSON type is accepted at the transport layer and the
+    service enforces that it is a string or None (stored verbatim, no
     verification at this layer). Typed as ``object`` so a non-string value
     (e.g. an int) reaches the service and is rejected with a 400 rather than
     being caught by Pydantic's transport validation (422).
+
+    **Producer identity comes from the trusted SecurityContext (Phase 6.0),
+    never from this request body.** The service ignores any client-supplied
+    ``producer_agent_id``; the stored producer is the authenticated caller.
     """
 
     type: str
     payload: object
-    producer_agent_id: str | None = None
     correlation_id: str | None = None
     signature: object | None = None
     is_security_event: StrictBool = False

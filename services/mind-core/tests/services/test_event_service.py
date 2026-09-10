@@ -5,8 +5,8 @@ Run against the isolated ``mind_test_db`` via the shared ``db`` fixture
 business boundary: append-only creation, reads, listing by correlation /
 producer / security flag, deterministic pagination, validation,
 NotFoundError semantics, transaction ownership (the service never
-commits or rolls back itself), and the deliberate absence of audit
-mirroring for ordinary event creation.
+commits or rolls back itself), and Phase 6.0 audit mirroring for
+ordinary event creation.
 
 All identifiers are unique per test so the suite is self-isolating and
 never relies on a clean persistent DB or global truncation.
@@ -49,16 +49,12 @@ def _make_agent(agents) -> dict:
     return agents.create(owner=_uid("owner"), purpose="p")
 
 
-def _make_event(service, agents=None, **overrides) -> dict:
-    # EventService.create() takes keyword-only arguments: ``type`` and
-    # ``payload`` are required, plus optional ``producer_agent_id``,
-    # ``correlation_id``, ``signature`` and ``is_security_event``. The
-    # helper keeps ``type`` and ``payload`` as distinct arguments (it must
-    # NOT merge them into one dict) and only auto-assigns a producer agent
-    # when the caller did not supply one.
-    kwargs: dict = {"type": "test", "payload": {}}
-    if agents is not None and "producer_agent_id" not in overrides:
-        kwargs["producer_agent_id"] = _make_agent(agents)["id"]
+def _make_event(service, agents=None, actor_id=None, **overrides) -> dict:
+    kwargs: dict = {
+        "type": "test",
+        "payload": {},
+        "actor_id": actor_id or _make_agent(agents)["id"],
+    }
     kwargs.update(overrides)
     return service.create(**kwargs)
 
@@ -69,12 +65,12 @@ def test_create_basic_event(service, agents):
     event = service.create(
         type="task.created",
         payload={"k": "v"},
-        producer_agent_id=agent["id"],
+        actor_id=agent["id"],
     )
     assert event["id"] is not None
     assert event["type"] == "task.created"
     assert event["payload"] == {"k": "v"}
-    assert event["producer_agent_id"] == agent["id"]
+    assert event["actor_id"] == agent["id"]
     assert event["is_security_event"] is False
     assert event["signature"] is None
 
@@ -86,7 +82,7 @@ def test_create_event_with_payload(service, agents):
     event = service.create(
         type="memory.stored",
         payload=payload,
-        producer_agent_id=agent["id"],
+        actor_id=agent["id"],
     )
     assert event["payload"] == payload
 
@@ -97,7 +93,7 @@ def test_create_security_event(service, agents):
     event = service.create(
         type="auth.denied",
         payload={"reason": "no-cap"},
-        producer_agent_id=agent["id"],
+        actor_id=agent["id"],
         is_security_event=True,
     )
     assert event["is_security_event"] is True
@@ -110,7 +106,7 @@ def test_create_event_with_signature(service, agents):
     event = service.create(
         type="signed.event",
         payload={"x": 1},
-        producer_agent_id=agent["id"],
+        actor_id=agent["id"],
         signature="deadbeef" * 8,
     )
     assert event["signature"] == "deadbeef" * 8
@@ -123,7 +119,7 @@ def test_create_event_with_optional_fields(service, agents):
     event = service.create(
         type="correlated.event",
         payload={"v": 1},
-        producer_agent_id=agent["id"],
+        actor_id=agent["id"],
         correlation_id=correlation,
         signature="sig",
         is_security_event=True,
@@ -134,12 +130,14 @@ def test_create_event_with_optional_fields(service, agents):
 
 
 # ── 6. create without producer (internal/unsigned) ───────
-def test_create_event_without_producer(service):
+def test_create_event_without_producer(service, agents):
+    agent = _make_agent(agents)
     event = service.create(
         type="system.boot",
         payload={"uptime": 0},
+        actor_id=agent["id"],
     )
-    assert event["producer_agent_id"] is None
+    assert event["producer_agent_id"] == agent["id"]
     assert event["signature"] is None
 
 
@@ -149,7 +147,7 @@ def test_create_nonexistent_producer_rejected(service):
         service.create(
             type="x",
             payload={"v": 1},
-            producer_agent_id=MISSING,
+            actor_id=MISSING,
         )
 
 
@@ -173,15 +171,15 @@ def test_list_by_correlation(service, agents):
     agent = _make_agent(agents)
     correlation = uuid.uuid4()
     service.create(
-        type="a", payload={"v": 1}, producer_agent_id=agent["id"],
+        type="a", payload={"v": 1}, actor_id=agent["id"],
         correlation_id=correlation,
     )
     service.create(
-        type="b", payload={"v": 2}, producer_agent_id=agent["id"],
+        type="b", payload={"v": 2}, actor_id=agent["id"],
         correlation_id=correlation,
     )
     service.create(
-        type="c", payload={"v": 3}, producer_agent_id=agent["id"],
+        type="c", payload={"v": 3}, actor_id=agent["id"],
         correlation_id=str(uuid.uuid4()),  # unrelated
     )
     rows = service.list_by_correlation(correlation)
@@ -199,12 +197,12 @@ def test_list_by_correlation_validation(service):
 def test_list_by_producer(service, agents):
     agent = _make_agent(agents)
     other = _make_agent(agents)
-    service.create(type="a", payload={}, producer_agent_id=agent["id"])
-    service.create(type="b", payload={}, producer_agent_id=agent["id"])
-    service.create(type="c", payload={}, producer_agent_id=other["id"])
+    service.create(type="a", payload={}, actor_id=agent["id"])
+    service.create(type="b", payload={}, actor_id=agent["id"])
+    service.create(type="c", payload={}, actor_id=other["id"])
     rows = service.list_by_producer(agent["id"])
     assert len(rows) == 2
-    assert all(r["producer_agent_id"] == agent["id"] for r in rows)
+    assert all(r["actor_id"] == agent["id"] for r in rows)
 
 
 # ── 13. list_by_producer validation ──────────────────────
@@ -217,14 +215,14 @@ def test_list_by_producer_validation(service):
 def test_list_security_events(service, agents):
     agent = _make_agent(agents)
     service.create(
-        type="a", payload={}, producer_agent_id=agent["id"],
+        type="a", payload={}, actor_id=agent["id"],
         is_security_event=True,
     )
     service.create(
-        type="b", payload={}, producer_agent_id=agent["id"],
+        type="b", payload={}, actor_id=agent["id"],
         is_security_event=True,
     )
-    service.create(type="c", payload={}, producer_agent_id=agent["id"])
+    service.create(type="c", payload={}, actor_id=agent["id"])
     rows = service.list_security_events()
     assert len(rows) == 2
     assert all(r["is_security_event"] is True for r in rows)
@@ -234,7 +232,7 @@ def test_list_security_events(service, agents):
 def test_pagination_limit(service, agents):
     agent = _make_agent(agents)
     for _ in range(5):
-        service.create(type="x", payload={}, producer_agent_id=agent["id"])
+        service.create(type="x", payload={}, actor_id=agent["id"])
     rows = service.list_by_producer(agent["id"], limit=2)
     assert len(rows) == 2
 
@@ -245,7 +243,7 @@ def test_pagination_offset_deterministic(service, agents):
     # the id DESC tiebreaker is what makes the slices disjoint/deterministic.
     agent = _make_agent(agents)
     for _ in range(5):
-        service.create(type="x", payload={}, producer_agent_id=agent["id"])
+        service.create(type="x", payload={}, actor_id=agent["id"])
     first = service.list_by_producer(agent["id"], limit=2, offset=0)
     second = service.list_by_producer(agent["id"], limit=2, offset=2)
     assert len(second) == 2
@@ -274,17 +272,17 @@ def test_invalid_pagination(service, agents):
 def test_create_validation_strings(service, agents):
     agent = _make_agent(agents)
     with pytest.raises(ValidationError):
-        service.create(type="", payload={}, producer_agent_id=agent["id"])
+        service.create(type="", payload={}, actor_id=agent["id"])
     with pytest.raises(ValidationError):
-        service.create(type=123, payload={}, producer_agent_id=agent["id"])
+        service.create(type=123, payload={}, actor_id=agent["id"])
     with pytest.raises(ValidationError):
-        service.create(type="x", payload=None, producer_agent_id=agent["id"])
+        service.create(type="x", payload=None, actor_id=agent["id"])
 
 
 # ── 19. validation: invalid UUIDs ────────────────────────
 def test_create_validation_uuids(service):
     with pytest.raises(ValidationError):
-        service.create(type="x", payload={}, producer_agent_id="not-a-uuid")
+        service.create(type="x", payload={}, actor_id="not-a-uuid")
     with pytest.raises(ValidationError):
         service.create(type="x", payload={}, correlation_id="not-a-uuid")
 
@@ -294,12 +292,12 @@ def test_create_validation_domain(service, agents):
     agent = _make_agent(agents)
     with pytest.raises(ValidationError):
         service.create(
-            type="x", payload={}, producer_agent_id=agent["id"],
+            type="x", payload={}, actor_id=agent["id"],
             is_security_event="yes",
         )
     with pytest.raises(ValidationError):
         service.create(
-            type="x", payload={}, producer_agent_id=agent["id"],
+            type="x", payload={}, actor_id=agent["id"],
             signature=123,
         )
 
@@ -335,13 +333,16 @@ def test_repository_is_used(monkeypatch, service, agents):
     assert called["append"] is True
 
 
-# ── 24. no audit row for ordinary event creation ────────
-def test_no_audit_mirroring_for_event_creation(service, agents, db):
+# ── 24. audit row for ordinary event creation (Phase 6.0) ─
+def test_audit_mirroring_for_event_creation(service, agents):
     event = _make_event(service, agents)
     audit = AuditService(db)
-    # Events are the stream; audit_logs are accountability. Ordinary event
-    # creation must NOT be mirrored into audit_logs.
-    assert audit.list_by_target("event", str(event["id"])) == []
+    # Phase 6.0: ordinary event creation IS mirrored into audit_logs.
+    rows = audit.list_by_target("event", str(event["id"]))
+    assert len(rows) == 1
+    assert rows[0]["action"] == "event.create"
+    assert rows[0]["outcome"] == "success"
+    assert rows[0]["capability_used"] == "write"
 
 
 # ── 25. mutation + atomicity (rollback) ──────────────────
@@ -350,7 +351,7 @@ def test_atomicity_rollback(db, agents):
     event_id = None
     with pytest.raises(ValueError), transaction(db):
         event_id = service.create(
-            type="x", payload={}, producer_agent_id=_make_agent(agents)["id"]
+            type="x", payload={}, actor_id=_make_agent(agents)["id"]
         )["id"]
         raise ValueError("simulated failure")
     with pytest.raises(NotFoundError):
@@ -365,7 +366,7 @@ def test_atomicity_commit(db, agents):
         with transaction(db):
             event = service.create(
                 type="x", payload={},
-                producer_agent_id=_make_agent(agents)["id"],
+                actor_id=_make_agent(agents)["id"],
             )
         assert service.get(event["id"]) is not None
     finally:

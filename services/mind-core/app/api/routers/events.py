@@ -1,4 +1,4 @@
-"""Event HTTP API router (Phase 5.5).
+"""Event HTTP API router (Phase 5.5 + Phase 6.0).
 
 Thin transport adapter over :class:`app.services.event_service.EventService`.
 It contains no SQL, never instantiates a repository, never opens a connection,
@@ -17,11 +17,13 @@ Events are immutable: this router exposes only ``POST`` (create) and ``GET``
 (read) endpoints. No ``PATCH`` / ``PUT`` / ``DELETE`` routes exist, matching
 the service's append-only contract.
 
-Audit boundary (intentionally absent)
+Authenticated publishing (Phase 6.0)
 -------------------------------------
-Event creation does NOT write to ``audit_logs``. The event stream and the
-audit log are distinct stores; mirroring is deliberately not performed here
-(see :mod:`app.services.event_service`).
+Event creation requires an authenticated ``SecurityContext`` and the generic
+``write`` capability. The producer identity stored in the event row comes
+from the trusted ``SecurityContext.actor_id``, never from the request body.
+This prevents producer-identity spoofing (threat T4). The client-supplied
+``producer_agent_id`` body field is ignored by the service.
 
 Signature policy
 ----------------
@@ -36,6 +38,7 @@ from fastapi import APIRouter, Depends, Query
 
 from app.api.dependencies import get_conn, get_txn
 from app.api.schemas.events import CreateEventRequest, EventResponse
+from app.api.security import SecurityContext, get_security_context
 from app.services.event_service import EventService
 
 router = APIRouter(prefix="/events", tags=["events"])
@@ -48,12 +51,23 @@ Conn = Annotated[object, Depends(get_conn)]
 
 
 @router.post("", response_model=EventResponse, status_code=201)
-def create_event(body: CreateEventRequest, conn: Txn) -> dict:
-    """Append a new event. Delegates all validation to EventService."""
+def create_event(
+    body: CreateEventRequest,
+    ctx: Annotated[SecurityContext, Depends(get_security_context)],
+    conn: Txn,
+) -> dict:
+    """Append a new event. Delegates all validation and authorization to EventService.
+
+    Caller identity comes from the trusted SecurityContext (Phase 6.0).
+    The producer_agent_id stored in the event is ctx.actor_id, never the
+    client-supplied body field.
+    """
     service = EventService(conn)
     return service.create(
         type=body.type,
         payload=body.payload,
+        actor_id=ctx.actor_id,
+        actor_type=ctx.actor_type,
         producer_agent_id=body.producer_agent_id,
         correlation_id=body.correlation_id,
         signature=body.signature,
