@@ -1,4 +1,4 @@
-"""Memory HTTP API router (Phase 5.6).
+"""Memory HTTP API router (Phase 5.6 + Phase 6.1).
 
 Thin transport adapter over :class:`app.services.memory_service.MemoryService`.
 It contains no SQL, never instantiates a repository, never opens a connection,
@@ -13,13 +13,15 @@ by the handlers registered in :mod:`app.api.errors`.
 
 Secret-classification policy boundary
 -------------------------------------
-There is currently NO authentication boundary in the HTTP layer, and the
-``secret`` classification is metadata only (not an authorization boundary).
-To avoid creating a new HTTP exposure for secret memories, this router
-rejects at the transport/policy boundary (using the existing
-:class:`PolicyViolationError`, mapped to HTTP 403) any request that would
-create or escalate a memory to ``secret``, or list ``secret`` memories. The
-value is rejected, never silently coerced to ``internal``.
+Phase 6.1 replaces the previous transport-layer blanket ban on ``secret``
+memories with proper capability-based authorization in
+:class:`MemoryService`. Creating or updating a memory with
+``classification="secret"`` now requires the generic ``data:pii`` capability
+(in addition to ``write``). The router no longer rejects ``secret`` on
+create/update; the service enforces the capability gate.
+
+Listing ``secret`` memories by classification remains blocked at the router
+policy boundary because read authorization is not yet implemented.
 """
 
 from __future__ import annotations
@@ -61,9 +63,9 @@ def create_memory(
     """Create a memory. Delegates all validation/audit to MemoryService.
 
     Caller identity comes from the trusted SecurityContext (Phase 5.8).
+    Secret classification requires the ``data:pii`` capability, enforced
+    in the service layer (Phase 6.1).
     """
-    if body.classification == _SECRET_CLASSIFICATION:
-        raise PolicyViolationError("secret classification is not exposed over the HTTP API")
     service = MemoryService(conn)
     return service.create(
         agent_id=body.agent_id,
@@ -124,9 +126,11 @@ def update_memory(
     ctx: Annotated[SecurityContext, Depends(get_security_context)],
     conn: Txn,
 ) -> dict:
-    """Update a memory. Delegates all validation/audit to MemoryService."""
-    if body.classification == _SECRET_CLASSIFICATION:
-        raise PolicyViolationError("secret classification is not exposed over the HTTP API")
+    """Update a memory. Delegates all validation/audit to MemoryService.
+
+    Secret classification requires the ``data:pii`` capability, enforced
+    in the service layer (Phase 6.1).
+    """
     service = MemoryService(conn)
     return service.update(
         memory_id,

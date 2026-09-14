@@ -1,4 +1,4 @@
-"""MemoryService — business boundary for the ``memories`` table (Phase 4.8).
+"""MemoryService — business boundary for the ``memories`` table (Phase 4.8 + Phase 6.1).
 
 This is the memory-store service boundary. It owns validation and
 existence checks, but contains no SQL and never creates a connection or
@@ -14,7 +14,7 @@ operation; immutability of history is preserved at the service boundary,
 matching the repository's soft-delete contract.
 
 Audit boundary (intentionally present)
---------------------------------------
+-------------------------------------
 Unlike :class:`EventService` (which deliberately does *not* mirror events
 into ``audit_logs``), memory mutations **are** audited here. The
 ``memories`` table carries a ``classification`` column (``public`` /
@@ -26,7 +26,7 @@ an ``audit_logs`` row. Reads (``get`` / ``list_*``) are not audited,
 consistent with :class:`AgentService`.
 
 Authorization boundary
-----------------------
+---------------------
 Per the approved Phase 5.7A security policy, every memory *mutation* is
 gated on the generic ``write`` capability (catalog: ``read | write | shell |
 network | data:pii | admin:roles``). No resource-scoped capability (e.g.
@@ -37,6 +37,14 @@ caller-owned transaction, **before** the mutation, via
 capability raises :class:`AuthorizationError` (HTTP 403); the denial is
 recorded in ``audit_logs`` with ``outcome='denied'`` and
 ``capability_used='write'``.
+
+Phase 6.1 adds a second gate for ``secret``-classified memories: the
+generic ``data:pii`` capability is additionally required. The effective
+classification is determined from the request (for create) or from the
+request merged with the existing row (for update). A transition to
+``secret`` always requires ``data:pii``; a transition away from ``secret``
+does not. The ``data:pii`` denial is recorded in ``audit_logs`` with
+``capability_used='data:pii'``.
 
 Audit actor
 -----------
@@ -98,7 +106,7 @@ class MemoryService(BaseService):
         # generic ``write`` capability check (Phase 5.8).
         self._perms = PermissionService(conn)
 
-    # ── authorization helpers (Phase 5.8) ───────────────────
+    # ── authorization helpers (Phase 5.8 + Phase 6.1) ──────
     def _require_write(self, actor_id: str) -> None:
         """Gate a mutation on the generic ``write`` capability.
 
@@ -108,6 +116,15 @@ class MemoryService(BaseService):
         """
         self._perms.require_write(actor_id)
 
+    def _require_data_pii(self, actor_id: str) -> None:
+        """Gate a secret-classification mutation on ``data:pii``.
+
+        ``actor_id`` is the trusted ``SecurityContext.actor_id`` supplied by the
+        router — never a client-supplied body/query field. Raises
+        :class:`AuthorizationError` (HTTP 403) when the capability is absent.
+        """
+        self._perms.require_data_pii(actor_id)
+
     def _audit_denied(
         self,
         *,
@@ -115,6 +132,7 @@ class MemoryService(BaseService):
         actor_id: str,
         action: str,
         target_id: str | None,
+        capability_used: str = "write",
     ) -> None:
         """Record a denied memory mutation (missing/insufficient capability)."""
         self._audit.record(
@@ -124,7 +142,7 @@ class MemoryService(BaseService):
             outcome="denied",
             target_type="memory",
             target_id=target_id,
-            capability_used="write",
+            capability_used=capability_used,
         )
 
     # ── helpers ────────────────────────────────────────────
@@ -220,8 +238,22 @@ class MemoryService(BaseService):
                 actor_id=actor_id,
                 action="memory.create",
                 target_id=None,
+                capability_used="write",
             )
             raise
+
+        if classification == "secret":
+            try:
+                self._require_data_pii(actor_id)
+            except AuthorizationError:
+                self._audit_denied(
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    action="memory.create",
+                    target_id=None,
+                    capability_used="data:pii",
+                )
+                raise
 
         memory = self.repository(MemoryRepository).create(
             agent_id=agent_id,
@@ -305,6 +337,8 @@ class MemoryService(BaseService):
         ):
             return existing
 
+        # Determine the names of fields being changed, for the success
+        # audit context (matches the original field-name audit contract).
         changed = [
             name
             for name, v in (
@@ -316,6 +350,16 @@ class MemoryService(BaseService):
             if v is not None
         ]
 
+        # Determine the effective resulting classification for authorization.
+        # A transition TO secret requires data:pii; a transition AWAY from
+        # secret does not. When classification is omitted, the existing
+        # classification is preserved.
+        effective_classification = (
+            classification
+            if classification is not None
+            else existing["classification"]
+        )
+
         # Authorization occurs inside the transaction, before the mutation.
         try:
             self._require_write(actor_id)
@@ -325,8 +369,22 @@ class MemoryService(BaseService):
                 actor_id=actor_id,
                 action="memory.update",
                 target_id=memory_id,
+                capability_used="write",
             )
             raise
+
+        if effective_classification == "secret":
+            try:
+                self._require_data_pii(actor_id)
+            except AuthorizationError:
+                self._audit_denied(
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    action="memory.update",
+                    target_id=memory_id,
+                    capability_used="data:pii",
+                )
+                raise
 
         updated = self.repository(MemoryRepository).update(
             memory_id,

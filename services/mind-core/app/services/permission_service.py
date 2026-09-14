@@ -40,6 +40,11 @@ WRITE_CAPABILITY = "write"
 # (read | write | shell | network | data:pii | admin:roles).
 ADMIN_CAPABILITY = "admin:roles"
 
+# PII access capability (Phase 6.1). Memory mutations that create or update a
+# ``secret``-classified memory are gated on this capability. The key already
+# exists in the catalog; no new capability is invented.
+DATA_PII_CAPABILITY = "data:pii"
+
 # Pagination ceiling for Phase 5.8 administrative list endpoints. Kept
 # consistent with the rest of the API surface.
 _MAX_LIMIT = 100
@@ -129,6 +134,17 @@ class PermissionService(BaseService):
         client-supplied body/query field.
         """
         self.require_capability(agent_id, WRITE_CAPABILITY)
+
+    # ── 3c. PII access gate (Phase 6.1) ─────────────────────
+    def require_data_pii(self, agent_id: str) -> None:
+        """Raise :class:`AuthorizationError` unless the agent holds ``data:pii``.
+
+        Thin, intent-revealing wrapper over :meth:`require_capability` for the
+        PII-access capability. The agent id is the trusted
+        ``SecurityContext.actor_id`` passed down by routers — never a
+        client-supplied body/query field.
+        """
+        self.require_capability(agent_id, DATA_PII_CAPABILITY)
 
     # ── 4. grant a direct capability ────────────────────────
     def grant_capability(

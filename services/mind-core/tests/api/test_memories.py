@@ -10,9 +10,14 @@ The router must remain a transport adapter: it calls ``MemoryService`` and
 nothing else (no SQL, no repository, no connection management, no commit/
 rollback, no audit mirroring). Those invariants are asserted directly.
 
-Secret-classification policy boundary: the router blocks any create/escalate
-to ``secret`` and any listing of ``secret`` memories at the policy boundary
-(403 ``policy_violation``), because there is no authentication layer yet.
+Secret-classification authorization boundary: the router previously blocked
+any create/escalate to ``secret`` at the policy boundary (403
+``policy_violation``). Phase 6.1 replaces that blanket ban with proper
+capability-based authorization in ``MemoryService``: creating or updating
+a memory with ``classification="secret"`` now requires the generic
+``data:pii`` capability in addition to ``write``. Listing ``secret``
+memories by classification remains blocked because read authorization is
+not yet implemented.
 """
 
 from __future__ import annotations
@@ -245,8 +250,8 @@ def test_post_memory_without_body_actor_id_succeeds(client):
     _cleanup_memory(resp.json()["id"])
 
 
-def test_post_memory_rejects_secret(client):
-    # Policy boundary: secret is metadata-only, no auth layer yet -> 403.
+def test_post_memory_rejects_secret_without_data_pii(client):
+    """Phase 6.1: secret requires data:pii capability, not just write."""
     agent_id = _make_agent()
     try:
         resp = client.post(
@@ -259,7 +264,7 @@ def test_post_memory_rejects_secret(client):
             },
         )
         assert resp.status_code == 403, resp.text
-        assert resp.json()["error"] == "policy_violation"
+        assert resp.json()["error"] == "forbidden"
     finally:
         _delete_agent(agent_id)
 
@@ -469,7 +474,8 @@ def test_patch_memory_not_found(client):
     assert resp.json()["error"] == "not_found"
 
 
-def test_patch_memory_rejects_secret(client):
+def test_patch_memory_rejects_secret_without_data_pii(client):
+    """Phase 6.1: escalating to secret requires data:pii capability."""
     agent_id = _make_agent()
     try:
         created = _create_memory(client, agent_id, content="internal")
@@ -481,7 +487,7 @@ def test_patch_memory_rejects_secret(client):
             },
         )
         assert resp.status_code == 403, resp.text
-        assert resp.json()["error"] == "policy_violation"
+        assert resp.json()["error"] == "forbidden"
         _cleanup_memory(mid)
     finally:
         _delete_agent(agent_id)

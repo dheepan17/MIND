@@ -5,8 +5,9 @@ Run against the isolated ``mind_test_db`` via the shared ``db`` fixture
 business boundary: creation, reads, updates, soft-deletion, listing by
 agent / classification, deterministic pagination, validation,
 NotFoundError semantics, transaction ownership (the service never commits
-or rolls back itself), the deliberate absence of a hard-delete API, and
-the audit trail for security-sensitive memory mutations.
+or rolls back itself), the deliberate absence of a hard-delete API, the
+audit trail for security-sensitive memory mutations, and Phase 6.1
+``data:pii`` authorization for ``secret``-classified memories.
 
 All identifiers are unique per test so the suite is self-isolating and
 never relies on a clean persistent DB or global truncation.
@@ -21,8 +22,10 @@ from psycopg.pq import TransactionStatus
 from app.db.transaction import transaction
 from app.repositories.agents import AgentRepository
 from app.repositories.memories import MemoryRepository
+from app.repositories.permissions import PermissionRepository
 from app.services import (
     AuditService,
+    AuthorizationError,
     MemoryService,
     NotFoundError,
     ValidationError,
@@ -41,12 +44,39 @@ def agents(db):
     return AgentRepository(db)
 
 
+@pytest.fixture
+def perms(db):
+    return PermissionRepository(db)
+
+
 def _uid(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4()}"
 
 
 def _make_agent(agents) -> dict:
     return agents.create(owner=_uid("owner"), purpose="p")
+
+
+def _make_agent_with_data_pii(agents, perms) -> dict:
+    """Create an agent with the generic ``write`` and ``data:pii`` capabilities."""
+    role = perms.create_role(f"pii-{uuid.uuid4()}")
+    write_cap = perms.create_capability("write")
+    pii_cap = perms.create_capability("data:pii")
+    perms.assign_capability_to_role(role["id"], write_cap["id"])
+    perms.assign_capability_to_role(role["id"], pii_cap["id"])
+    return agents.create(
+        owner=_uid("owner"), purpose="p", primary_role_id=role["id"]
+    )
+
+
+def _make_writer_agent(agents, perms) -> dict:
+    """Create an agent with the generic ``write`` capability only (no data:pii)."""
+    role = perms.create_role(f"writer-{uuid.uuid4()}")
+    write_cap = perms.create_capability("write")
+    perms.assign_capability_to_role(role["id"], write_cap["id"])
+    return agents.create(
+        owner=_uid("owner"), purpose="p", primary_role_id=role["id"]
+    )
 
 
 def _make_memory(service, agents, **overrides) -> dict:
@@ -79,8 +109,8 @@ def test_create_basic_memory(service, agents):
 
 
 # 2. create with all optional fields
-def test_create_with_optional_fields(service, agents):
-    agent = _make_agent(agents)
+def test_create_with_optional_fields(service, agents, perms):
+    agent = _make_agent_with_data_pii(agents, perms)
     mem = service.create(
         agent_id=agent["id"],
         type="episodic",
@@ -88,6 +118,7 @@ def test_create_with_optional_fields(service, agents):
         classification="secret",
         embedding=[0.1, 0.2, 0.3],
         metadata={"src": "chat"},
+        actor_id=agent["id"],
     )
     assert mem["classification"] == "secret"
     assert mem["embedding"] == [0.1, 0.2, 0.3]
@@ -125,10 +156,11 @@ def test_update_content(service, agents):
 
 
 # 7. update classification
-def test_update_classification(service, agents):
-    mem = _make_memory(service, agents)
+def test_update_classification(service, agents, perms):
+    agent = _make_agent_with_data_pii(agents, perms)
+    mem = _make_memory(service, agents, agent_id=agent["id"])
     updated = service.update(
-        mem["id"], classification="secret", actor_id="agent-1"
+        mem["id"], classification="secret", actor_id=agent["id"]
     )
     assert updated["classification"] == "secret"
 
@@ -198,19 +230,22 @@ def test_list_by_agent(service, agents):
 
 
 # 15. list_by_classification
-def test_list_by_classification(service, agents):
-    agent = _make_agent(agents)
+def test_list_by_classification(service, agents, perms):
+    agent = _make_agent_with_data_pii(agents, perms)
     service.create(
         agent_id=agent["id"], type="semantic", content="a",
         classification="secret",
+        actor_id=agent["id"],
     )
     service.create(
         agent_id=agent["id"], type="semantic", content="b",
         classification="secret",
+        actor_id=agent["id"],
     )
     service.create(
         agent_id=agent["id"], type="semantic", content="c",
         classification="internal",
+        actor_id=agent["id"],
     )
     rows = service.list_by_classification("secret")
     assert len(rows) == 2
@@ -326,8 +361,9 @@ def test_repository_is_used(monkeypatch, service, agents):
 
 
 # 25. audit trail for create
-def test_audit_on_create(service, agents, db):
-    mem = _make_memory(service, agents, classification="secret")
+def test_audit_on_create(service, agents, perms, db):
+    agent = _make_agent_with_data_pii(agents, perms)
+    mem = _make_memory(service, agents, classification="secret", actor_id=agent["id"])
     audit = AuditService(db)
     rows = audit.list_by_target("memory", str(mem["id"]))
     assert len(rows) == 1
@@ -349,7 +385,107 @@ def test_audit_on_update(service, agents, db):
     assert "content" in rows[0]["context"]["fields"]
 
 
-# 27. audit trail for soft_delete
+# - Phase 6.1: data:pii authorization for secret memories ----
+def test_create_secret_requires_data_pii(service, agents, perms):
+    writer = _make_agent(agents)
+    with pytest.raises(AuthorizationError):
+        service.create(
+            agent_id=writer["id"],
+            type="semantic",
+            content="secret",
+            classification="secret",
+            actor_id=writer["id"],
+        )
+
+
+def test_create_secret_with_data_pii_succeeds(service, agents, perms):
+    pii_agent = _make_agent_with_data_pii(agents, perms)
+    mem = service.create(
+        agent_id=pii_agent["id"],
+        type="semantic",
+        content="secret",
+        classification="secret",
+        actor_id=pii_agent["id"],
+    )
+    assert mem["classification"] == "secret"
+
+
+def test_update_to_secret_requires_data_pii(service, agents, perms):
+    writer = _make_writer_agent(agents, perms)
+    pii_agent = _make_agent_with_data_pii(agents, perms)
+    mem = _make_memory(
+        service, agents,
+        agent_id=pii_agent["id"],
+        classification="internal",
+        actor_id=pii_agent["id"],
+    )
+    with pytest.raises(AuthorizationError):
+        service.update(
+            mem["id"], classification="secret", actor_id=writer["id"]
+        )
+
+
+def test_update_to_secret_with_data_pii_succeeds(service, agents, perms):
+    pii_agent = _make_agent_with_data_pii(agents, perms)
+    mem = _make_memory(service, agents, agent_id=pii_agent["id"], classification="internal")
+    updated = service.update(
+        mem["id"], classification="secret", actor_id=pii_agent["id"]
+    )
+    assert updated["classification"] == "secret"
+
+
+def test_secret_to_internal_does_not_require_data_pii(service, agents, perms):
+    writer = _make_writer_agent(agents, perms)
+    pii_agent = _make_agent_with_data_pii(agents, perms)
+    mem = _make_memory(
+        service, agents, agent_id=pii_agent["id"], classification="secret",
+        actor_id=pii_agent["id"],
+    )
+    updated = service.update(
+        mem["id"], classification="internal", actor_id=writer["id"]
+    )
+    assert updated["classification"] == "internal"
+
+
+def test_denied_data_pii_audit_recorded(service, agents, perms, db):
+    writer = _make_writer_agent(agents, perms)
+    mem_owner = _make_agent(agents)
+    with pytest.raises(AuthorizationError):
+        service.create(
+            agent_id=mem_owner["id"],
+            type="semantic",
+            content="secret",
+            classification="secret",
+            actor_id=writer["id"],
+        )
+    audit = AuditService(db)
+    rows = audit.list_by_actor("agent", writer["id"])
+    denied = [r for r in rows if r["action"] == "memory.create" and r["outcome"] == "denied"]
+    assert len(denied) >= 1
+    assert denied[0]["capability_used"] == "data:pii"
+
+
+def test_public_internal_still_require_only_write(service, agents, perms):
+    writer = _make_writer_agent(agents, perms)
+    mem_public = service.create(
+        agent_id=writer["id"],
+        type="semantic",
+        content="public",
+        classification="public",
+        actor_id=writer["id"],
+    )
+    assert mem_public["classification"] == "public"
+    mem_internal = service.create(
+        agent_id=writer["id"],
+        type="semantic",
+        content="internal",
+        classification="internal",
+        actor_id=writer["id"],
+    )
+    assert mem_internal["classification"] == "internal"
+
+
+# - 27. audit trail for soft_delete ----
 def test_audit_on_soft_delete(service, agents, db):
     mem = _make_memory(service, agents)
     service.soft_delete(mem["id"], actor_id="agent-1")
