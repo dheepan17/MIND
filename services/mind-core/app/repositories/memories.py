@@ -114,15 +114,19 @@ class MemoryRepository(BaseRepository):
             return self._normalize(cur.fetchone())
 
     def list_by_agent(
-        self, agent_id: str, limit: int = 50, offset: int = 0
+        self, agent_id: str, limit: int = 50, offset: int = 0, exclude_secret: bool = False
     ) -> list[dict]:
         sql = (
             "SELECT * FROM memories WHERE agent_id = %s "
             "AND deleted_at IS NULL "
-            "ORDER BY created_at DESC LIMIT %s OFFSET %s"
         )
+        params = [agent_id]
+        if exclude_secret:
+            sql += "AND classification != 'secret' "
+        sql += "ORDER BY created_at DESC LIMIT %s OFFSET %s"
+        params.extend([limit, offset])
         with self._cur() as cur:
-            cur.execute(sql, (agent_id, limit, offset))
+            cur.execute(sql, tuple(params))
             return [self._normalize(r) for r in cur.fetchall()]
 
     def list_by_classification(

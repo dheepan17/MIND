@@ -124,3 +124,18 @@ def internal_security_context(actor_type: str, actor_id: str) -> SecurityContext
         authenticated=True,
         source="internal",
     )
+
+
+def get_optional_security_context(request: Request) -> SecurityContext | None:
+    """FastAPI dependency: resolve the trusted caller, or None if unauthenticated.
+
+    Unlike :func:`get_security_context`, this does not raise on authentication
+    failure. It returns ``None`` for unauthenticated requests, allowing public
+    and internal memory reads to proceed without a trusted identity. Secret
+    reads still require an authenticated context with ``data:pii``, enforced
+    in the service layer.
+    """
+    try:
+        return _resolver(request)
+    except AuthenticationError:
+        return None
